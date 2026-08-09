@@ -13,6 +13,41 @@
 #include <lwip/netdb.h>
 
 #include "config.h"
+#include "irc_server.h"
+
+#define IRC_MAX_USERS 16
+#define IRC_LISTEN_BACKLOG IRC_MAX_USERS
+#define CLIENT_TASK_STACK_SIZE 4096
+#define CLIENT_TASK_PRIORITY 5
+
+static portMUX_TYPE user_count_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t connected_users;
+
+uint32_t irc_server_get_user_count(void)
+{
+    portENTER_CRITICAL(&user_count_lock);
+    uint32_t count = connected_users;
+    portEXIT_CRITICAL(&user_count_lock);
+    return count;
+}
+
+static bool try_add_user(void)
+{
+    portENTER_CRITICAL(&user_count_lock);
+    bool added = connected_users < IRC_MAX_USERS;
+    if (added) {
+        connected_users++;
+    }
+    portEXIT_CRITICAL(&user_count_lock);
+    return added;
+}
+
+static void remove_user(void)
+{
+    portENTER_CRITICAL(&user_count_lock);
+    connected_users--;
+    portEXIT_CRITICAL(&user_count_lock);
+}
 
 static void do_retransmit(const int sock)
 {
@@ -43,6 +78,18 @@ static void do_retransmit(const int sock)
             }
         }
     } while (len > 0);
+}
+
+static void irc_client_task(void *pvParameters)
+{
+    int sock = (int)(intptr_t)pvParameters;
+
+    do_retransmit(sock);
+
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
+    remove_user();
+    vTaskDelete(NULL);
 }
 
 void irc_server_task(void *pvParameters)
@@ -83,7 +130,7 @@ void irc_server_task(void *pvParameters)
     }
     ESP_LOGI(TAG, "Socket bound, port %d", PORT);
 
-    err = listen(listen_sock, 1);
+    err = listen(listen_sock, IRC_LISTEN_BACKLOG);
     if (err != 0) {
         ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
         goto CLEAN_UP;
@@ -112,10 +159,26 @@ void irc_server_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
 
-        do_retransmit(sock);
+        if (!try_add_user()) {
+            ESP_LOGW(TAG, "Maximum of %d users reached; rejecting connection", IRC_MAX_USERS);
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+            continue;
+        }
 
-        shutdown(sock, 0);
-        close(sock);
+        BaseType_t task_created = xTaskCreate(
+            irc_client_task,
+            "irc_client",
+            CLIENT_TASK_STACK_SIZE,
+            (void *)(intptr_t)sock,
+            CLIENT_TASK_PRIORITY,
+            NULL);
+        if (task_created != pdPASS) {
+            ESP_LOGE(TAG, "Unable to create client task");
+            remove_user();
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+        }
     }
 
 CLEAN_UP:

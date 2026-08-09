@@ -14,10 +14,12 @@
 #include <lwip/netdb.h>
 
 #include "config.h"
+#include "wifi.h"
 
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t wifi_event_group;
+static esp_ip4_addr_t wifi_ip_address;
 
 static void wifi_health_task(void *pvParameters)
 {
@@ -73,6 +75,7 @@ static void event_handler(void *arg,
             (wifi_event_sta_disconnected_t *)event_data;
 
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        wifi_ip_address.addr = 0;
         ESP_LOGW(TAG, "Disconnected (reason %d), reconnecting...", event->reason);
 
         esp_err_t err = esp_wifi_connect();
@@ -89,6 +92,7 @@ static void event_handler(void *arg,
 
         ESP_LOGI(TAG, "Got IP: " IPSTR,
                  IP2STR(&event->ip_info.ip));
+        wifi_ip_address = event->ip_info.ip;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -146,4 +150,16 @@ void wifi_init(void) {
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_LOGI(TAG, "Wi-Fi initialization finished");
+}
+
+bool wifi_get_ip_address(char *buffer, size_t buffer_size)
+{
+    if (buffer == NULL || buffer_size == 0 || wifi_event_group == NULL ||
+        (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
+        return false;
+    }
+
+    esp_ip4_addr_t ip = wifi_ip_address;
+    snprintf(buffer, buffer_size, IPSTR, IP2STR(&ip));
+    return true;
 }
