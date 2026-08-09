@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "lwip/sockets.h"
 #include <lwip/netdb.h>
 
@@ -14,8 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include "config.h"
+#include "clock_sync.h"
 #include "irc_server.h"
 #include "message_store.h"
 
@@ -29,11 +32,18 @@
 #define IRC_CLIENT_STACK_SIZE  6144
 #define IRC_CLIENT_PRIORITY    5
 #define IRC_SERVER_NAME        "esp-irc"
+#define IRC_MAX_OUTPUT         768
+#define IRC_HISTORY_LIMIT      50
 
 typedef struct irc_client {
     int socket;
     bool used;
     bool registered;
+    bool cap_negotiating;
+    bool cap_batch;
+    bool cap_server_time;
+    bool cap_message_tags;
+    bool cap_chathistory;
     char nick[IRC_NICK_LEN];
     char user[IRC_USER_LEN];
     char realname[IRC_REALNAME_LEN];
@@ -76,12 +86,51 @@ static bool send_all(int socket, const char *data, size_t length)
 
 static bool send_line(irc_client_t *client, const char *line)
 {
-    char output[IRC_MAX_LINE + 3];
-    size_t length = strnlen(line, IRC_MAX_LINE);
+    char output[IRC_MAX_OUTPUT + 3];
+    size_t length = strnlen(line, IRC_MAX_OUTPUT);
     memcpy(output, line, length);
     output[length++] = '\r';
     output[length++] = '\n';
     return send_all(client->socket, output, length);
+}
+
+static void format_timestamp(int64_t seconds, int32_t microseconds,
+                             char *output, size_t size)
+{
+    time_t value = (time_t)seconds;
+    struct tm utc;
+    gmtime_r(&value, &utc);
+    size_t length = strftime(output, size, "%Y-%m-%dT%H:%M:%S", &utc);
+    unsigned milliseconds = microseconds >= 0 && microseconds < 1000000
+                                ? (unsigned)microseconds / 1000 : 0;
+    if (length && length < size)
+        snprintf(output + length, size - length, ".%03uZ", milliseconds);
+}
+
+static bool parse_timestamp(const char *reference, int64_t *seconds,
+                            int32_t *microseconds)
+{
+    if (!reference || strncmp(reference, "timestamp=", 10) != 0) return false;
+    int year, month, day, hour, minute, second, millisecond;
+    char tail;
+    if (sscanf(reference + 10, "%4d-%2d-%2dT%2d:%2d:%2d.%3dZ%c",
+               &year, &month, &day, &hour, &minute, &second,
+               &millisecond, &tail) != 7 || year < 1970 || month < 1 ||
+        month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 ||
+        second > 60 || millisecond < 0 || millisecond > 999) return false;
+    struct tm utc = {
+        .tm_year = year - 1900,
+        .tm_mon = month - 1,
+        .tm_mday = day,
+        .tm_hour = hour,
+        .tm_min = minute,
+        .tm_sec = second,
+    };
+    time_t parsed = timegm(&utc);
+    if (parsed < 0) return false;
+    *seconds = (int64_t)parsed;
+    *microseconds = millisecond * 1000;
+    return true;
 }
 
 static void reply(irc_client_t *client, int numeric, const char *text)
@@ -108,6 +157,19 @@ static void broadcast_locked(const char *line, const irc_client_t *except,
         if (channel_index >= 0 && !target->joined[channel_index]) continue;
         send_line(target, line);
     }
+}
+
+static void send_live_message(irc_client_t *target, const char *line,
+                              int64_t seconds, int32_t microseconds)
+{
+    if (!target->cap_server_time || seconds == 0) {
+        send_line(target, line);
+        return;
+    }
+    char timestamp[32], tagged[IRC_MAX_OUTPUT + 1];
+    format_timestamp(seconds, microseconds, timestamp, sizeof(timestamp));
+    snprintf(tagged, sizeof(tagged), "@time=%s %s", timestamp, line);
+    send_line(target, tagged);
 }
 
 static bool valid_nick(const char *nick)
@@ -149,7 +211,8 @@ static void send_names(irc_client_t *client, int channel_index)
 
 static void complete_registration(irc_client_t *client)
 {
-    if (client->registered || !client->nick[0] || !client->user[0]) return;
+    if (client->registered || client->cap_negotiating ||
+        !client->nick[0] || !client->user[0]) return;
     client->registered = true;
     char text[IRC_MAX_LINE];
     snprintf(text, sizeof(text), ":Welcome to ESP IRC, %s!%s@esp.local", client->nick, client->user);
@@ -157,7 +220,7 @@ static void complete_registration(irc_client_t *client)
     reply(client, 2, ":Your host is esp-irc, running version 1.0");
     reply(client, 3, ":This server was created for ESP-IDF");
     reply(client, 4, "esp-irc 1.0 io nt");
-    reply(client, 5, "CHANTYPES=# NICKLEN=23 CHANNELLEN=31 CASEMAPPING=ascii NETWORK=ESPIRC :are supported by this server");
+    reply(client, 5, "CHANTYPES=# NICKLEN=23 CHANNELLEN=31 CASEMAPPING=ascii NETWORK=ESPIRC CHATHISTORY=50 MSGREFTYPES=timestamp :are supported by this server");
     reply(client, 375, ":- esp-irc Message of the Day -");
     reply(client, 372, ":- A tiny IRC server running on an ESP32.");
     reply(client, 376, ":End of /MOTD command");
@@ -236,9 +299,17 @@ static void handle_message(irc_client_t *client, char *target, char *message, bo
     if (target[0] == '#') {
         int index = find_channel_locked(target);
         if (index < 0 || !client->joined[index]) { unlock_state(); if (!notice) reply(client, 404, "* :Cannot send to channel"); return; }
+        int64_t timestamp_seconds;
+        int32_t timestamp_microseconds;
+        clock_sync_now(&timestamp_seconds, &timestamp_microseconds);
         message_store_enqueue(notice ? MESSAGE_STORE_NOTICE : MESSAGE_STORE_PRIVMSG,
-                              channels[index].name, client->nick, message);
-        broadcast_locked(line, client, index);
+                              channels[index].name, client->nick, message,
+                              timestamp_seconds, timestamp_microseconds);
+        for (int i = 0; i < IRC_MAX_USERS; ++i) {
+            irc_client_t *recipient = &clients[i];
+            if (!recipient->used || recipient == client || !recipient->joined[index]) continue;
+            send_live_message(recipient, line, timestamp_seconds, timestamp_microseconds);
+        }
     } else {
         irc_client_t *recipient = NULL;
         for (int i = 0; i < IRC_MAX_USERS; ++i)
@@ -262,6 +333,190 @@ static void handle_list(irc_client_t *client)
     reply(client, 323, ":End of /LIST");
 }
 
+static void handle_cap(irc_client_t *client, char *subcommand, char *arguments)
+{
+    const char *target = client->nick[0] ? client->nick : "*";
+    char line[IRC_MAX_LINE];
+    if (!subcommand) return;
+    if (!strcasecmp(subcommand, "LS")) {
+        client->cap_negotiating = true;
+        snprintf(line, sizeof(line), ":%s CAP %s LS :batch draft/chathistory message-tags server-time",
+                 IRC_SERVER_NAME, target);
+        send_line(client, line);
+        return;
+    }
+    if (!strcasecmp(subcommand, "LIST")) {
+        char enabled[96] = "";
+        if (client->cap_batch) strlcat(enabled, "batch ", sizeof(enabled));
+        if (client->cap_chathistory) strlcat(enabled, "draft/chathistory ", sizeof(enabled));
+        if (client->cap_message_tags) strlcat(enabled, "message-tags ", sizeof(enabled));
+        if (client->cap_server_time) strlcat(enabled, "server-time ", sizeof(enabled));
+        size_t length = strlen(enabled);
+        if (length && enabled[length - 1] == ' ') enabled[length - 1] = '\0';
+        snprintf(line, sizeof(line), ":%s CAP %s LIST :%s", IRC_SERVER_NAME, target, enabled);
+        send_line(client, line);
+        return;
+    }
+    if (!strcasecmp(subcommand, "END")) {
+        client->cap_negotiating = false;
+        complete_registration(client);
+        return;
+    }
+    if (strcasecmp(subcommand, "REQ") || !arguments || !*arguments) return;
+
+    bool batch = client->cap_batch;
+    bool chathistory = client->cap_chathistory;
+    bool message_tags = client->cap_message_tags;
+    bool server_time = client->cap_server_time;
+    char requested[160];
+    strlcpy(requested, arguments, sizeof(requested));
+    char *save = NULL;
+    for (char *capability = strtok_r(requested, " ", &save); capability;
+         capability = strtok_r(NULL, " ", &save)) {
+        bool enable = capability[0] != '-';
+        const char *name = enable ? capability : capability + 1;
+        if (!strcmp(name, "batch")) batch = enable;
+        else if (!strcmp(name, "draft/chathistory")) chathistory = enable;
+        else if (!strcmp(name, "message-tags")) message_tags = enable;
+        else if (!strcmp(name, "server-time")) server_time = enable;
+        else {
+            snprintf(line, sizeof(line), ":%s CAP %s NAK :%s",
+                     IRC_SERVER_NAME, target, arguments);
+            send_line(client, line);
+            return;
+        }
+    }
+    client->cap_batch = batch;
+    client->cap_chathistory = chathistory;
+    client->cap_message_tags = message_tags;
+    client->cap_server_time = server_time;
+    snprintf(line, sizeof(line), ":%s CAP %s ACK :%s",
+             IRC_SERVER_NAME, target, arguments);
+    send_line(client, line);
+}
+
+static void history_fail(irc_client_t *client, const char *code,
+                         const char *context, const char *description)
+{
+    char line[IRC_MAX_LINE];
+    snprintf(line, sizeof(line), ":%s FAIL CHATHISTORY %s %s :%s",
+             IRC_SERVER_NAME, code, context ? context : "*", description);
+    send_line(client, line);
+}
+
+static void handle_chathistory(irc_client_t *client, char *subcommand, char *arguments)
+{
+    if (!client->cap_chathistory) {
+        history_fail(client, "INVALID_PARAMS", subcommand, "Capability not negotiated");
+        return;
+    }
+    if (!subcommand || !arguments) {
+        history_fail(client, "INVALID_PARAMS", subcommand, "Insufficient parameters");
+        return;
+    }
+
+    char args[IRC_MAX_LINE];
+    strlcpy(args, arguments, sizeof(args));
+    char *save = NULL;
+    char *target = strtok_r(args, " ", &save);
+    char *reference = strtok_r(NULL, " ", &save);
+    char *limit_text = strtok_r(NULL, " ", &save);
+    char *extra = strtok_r(NULL, " ", &save);
+    if (!target || !reference || !limit_text || extra) {
+        history_fail(client, "INVALID_PARAMS", subcommand, "Invalid parameters");
+        return;
+    }
+
+    char *limit_end;
+    long requested_limit = strtol(limit_text, &limit_end, 10);
+    if (*limit_end || requested_limit <= 0 || requested_limit > IRC_HISTORY_LIMIT) {
+        history_fail(client, "INVALID_PARAMS", limit_text, "Invalid message limit");
+        return;
+    }
+
+    lock_state();
+    int channel_index = target[0] == '#' ? find_channel_locked(target) : -1;
+    bool allowed = channel_index >= 0 && client->joined[channel_index];
+    unlock_state();
+    if (!allowed) {
+        history_fail(client, "INVALID_TARGET", target, "Messages could not be retrieved");
+        return;
+    }
+
+    message_store_query_t query;
+    int64_t reference_seconds = 0;
+    int32_t reference_microseconds = 0;
+    if (!strcasecmp(subcommand, "LATEST")) {
+        if (!strcmp(reference, "*")) query = MESSAGE_STORE_LATEST;
+        else if (parse_timestamp(reference, &reference_seconds, &reference_microseconds))
+            query = MESSAGE_STORE_LATEST_AFTER;
+        else {
+            history_fail(client, "INVALID_MSGREFTYPE", reference,
+                         "Only timestamp references are supported");
+            return;
+        }
+    } else if (!strcasecmp(subcommand, "BEFORE") || !strcasecmp(subcommand, "AFTER")) {
+        if (!parse_timestamp(reference, &reference_seconds, &reference_microseconds)) {
+            history_fail(client, "INVALID_MSGREFTYPE", reference,
+                         "Only timestamp references are supported");
+            return;
+        }
+        query = !strcasecmp(subcommand, "BEFORE") ? MESSAGE_STORE_BEFORE : MESSAGE_STORE_AFTER;
+    } else {
+        history_fail(client, "INVALID_PARAMS", subcommand, "Unknown subcommand");
+        return;
+    }
+
+    size_t limit = (size_t)requested_limit;
+    message_store_record_t *records = calloc(limit, sizeof(*records));
+    if (!records) {
+        history_fail(client, "MESSAGE_ERROR", target, "Messages could not be retrieved");
+        return;
+    }
+    size_t count = 0;
+    bool more_available = false;
+    if (!message_store_query(target, query, reference_seconds, reference_microseconds,
+                             limit, records, &count, &more_available)) {
+        free(records);
+        history_fail(client, "MESSAGE_ERROR", target, "Messages could not be retrieved");
+        return;
+    }
+
+    char batch_id[12] = "";
+    char line[IRC_MAX_OUTPUT + 1];
+    if (client->cap_batch) {
+        snprintf(batch_id, sizeof(batch_id), "%08lx", (unsigned long)esp_random());
+        snprintf(line, sizeof(line), "%s:%s BATCH +%s chathistory %s",
+                 more_available ? "" : "@draft/chathistory-end ",
+                 IRC_SERVER_NAME, batch_id, target);
+        send_line(client, line);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        char tags[96] = "";
+        if (client->cap_batch) snprintf(tags, sizeof(tags), "batch=%s", batch_id);
+        if (client->cap_server_time) {
+            char timestamp[32];
+            format_timestamp(records[i].timestamp_seconds,
+                             records[i].timestamp_microseconds,
+                             timestamp, sizeof(timestamp));
+            if (tags[0]) strlcat(tags, ";", sizeof(tags));
+            strlcat(tags, "time=", sizeof(tags));
+            strlcat(tags, timestamp, sizeof(tags));
+        }
+        snprintf(line, sizeof(line), "%s%s%s:%s!unknown@esp.local %s %s :%s",
+                 tags[0] ? "@" : "", tags, tags[0] ? " " : "",
+                 records[i].nick,
+                 records[i].type == MESSAGE_STORE_NOTICE ? "NOTICE" : "PRIVMSG",
+                 records[i].channel, records[i].message);
+        send_line(client, line);
+    }
+    if (client->cap_batch) {
+        snprintf(line, sizeof(line), ":%s BATCH -%s", IRC_SERVER_NAME, batch_id);
+        send_line(client, line);
+    }
+    free(records);
+}
+
 static void handle_command(irc_client_t *client, char *line)
 {
     char *save = NULL;
@@ -272,11 +527,7 @@ static void handle_command(irc_client_t *client, char *line)
     while (trailing && *trailing == ' ') trailing++;
     if (trailing && *trailing == ':') trailing++;
 
-    if (!strcasecmp(command, "CAP")) {
-        if (param && !strcasecmp(param, "LS")) send_line(client, ":esp-irc CAP * LS :");
-        else if (param && !strcasecmp(param, "REQ")) send_line(client, ":esp-irc CAP * NAK :");
-        return;
-    }
+    if (!strcasecmp(command, "CAP")) { handle_cap(client, param, trailing); return; }
     if (!strcasecmp(command, "NICK")) { handle_nick(client, param); return; }
     if (!strcasecmp(command, "USER")) {
         if (!param) { reply(client, 461, "USER :Not enough parameters"); return; }
@@ -296,6 +547,7 @@ static void handle_command(irc_client_t *client, char *line)
     if (!strcasecmp(command, "PART")) { handle_part(client, param, trailing); return; }
     if (!strcasecmp(command, "PRIVMSG")) { handle_message(client, param, trailing, false); return; }
     if (!strcasecmp(command, "NOTICE")) { handle_message(client, param, trailing, true); return; }
+    if (!strcasecmp(command, "CHATHISTORY")) { handle_chathistory(client, param, trailing); return; }
     if (!strcasecmp(command, "LIST")) { handle_list(client); return; }
     if (!strcasecmp(command, "NAMES")) {
         lock_state(); int index = param ? find_channel_locked(param) : -1; unlock_state();

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,7 +16,6 @@
 #include "freertos/task.h"
 #include "wear_levelling.h"
 
-#include "clock_sync.h"
 #include "config.h"
 
 #define STORE_PATH "/store"
@@ -26,15 +26,13 @@
 #define STORE_SEGMENT_SIZE (128 * 1024)
 #define STORE_MAGIC 0x43495245U /* "ERIC", stored little-endian */
 #define STORE_VERSION 1
-#define STORE_CHANNEL_MAX 31
-#define STORE_NICK_MAX 23
-#define STORE_MESSAGE_MAX 511
-
 typedef struct {
     uint8_t type;
-    char channel[STORE_CHANNEL_MAX + 1];
-    char nick[STORE_NICK_MAX + 1];
-    char message[STORE_MESSAGE_MAX + 1];
+    int64_t timestamp_seconds;
+    int32_t timestamp_microseconds;
+    char channel[MESSAGE_STORE_CHANNEL_MAX + 1];
+    char nick[MESSAGE_STORE_NICK_MAX + 1];
+    char message[MESSAGE_STORE_MESSAGE_MAX + 1];
 } queued_message_t;
 
 typedef struct __attribute__((packed)) {
@@ -136,11 +134,8 @@ static bool write_message(FILE *file, const queued_message_t *message)
         .nick_length = (uint8_t)strlen(message->nick),
         .message_length = (uint16_t)strlen(message->message),
     };
-    int64_t timestamp_seconds;
-    int32_t timestamp_microseconds;
-    clock_sync_now(&timestamp_seconds, &timestamp_microseconds);
-    header.timestamp_seconds = timestamp_seconds;
-    header.timestamp_microseconds = timestamp_microseconds;
+    header.timestamp_seconds = message->timestamp_seconds;
+    header.timestamp_microseconds = message->timestamp_microseconds;
     header.record_size = sizeof(header) + header.channel_length +
                          header.nick_length + header.message_length;
 
@@ -236,10 +231,15 @@ void message_store_init(void)
 }
 
 bool message_store_enqueue(message_store_type_t type, const char *channel,
-                           const char *nick, const char *message)
+                           const char *nick, const char *message,
+                           int64_t timestamp_seconds, int32_t timestamp_microseconds)
 {
     if (!store_queue || !channel || !nick || !message) return false;
-    queued_message_t queued = { .type = (uint8_t)type };
+    queued_message_t queued = {
+        .type = (uint8_t)type,
+        .timestamp_seconds = timestamp_seconds,
+        .timestamp_microseconds = timestamp_microseconds,
+    };
     strlcpy(queued.channel, channel, sizeof(queued.channel));
     strlcpy(queued.nick, nick, sizeof(queued.nick));
     strlcpy(queued.message, message, sizeof(queued.message));
@@ -247,5 +247,90 @@ bool message_store_enqueue(message_store_type_t type, const char *channel,
         ESP_LOGW(TAG, "Message storage queue full; dropping persisted copy");
         return false;
     }
+    return true;
+}
+
+static bool timestamp_matches(message_store_query_t query,
+                              int64_t seconds, int32_t microseconds,
+                              int64_t reference_seconds, int32_t reference_microseconds)
+{
+    int comparison = seconds < reference_seconds ? -1 :
+                     seconds > reference_seconds ? 1 :
+                     microseconds < reference_microseconds ? -1 :
+                     microseconds > reference_microseconds ? 1 : 0;
+    return query == MESSAGE_STORE_LATEST ||
+           (query == MESSAGE_STORE_LATEST_AFTER && comparison > 0) ||
+           (query == MESSAGE_STORE_BEFORE && comparison < 0) ||
+           (query == MESSAGE_STORE_AFTER && comparison > 0);
+}
+
+static bool read_record(FILE *file, message_store_record_t *record)
+{
+    stored_header_t header;
+    if (fread(&header, sizeof(header), 1, file) != 1) return false;
+    size_t payload_size = (size_t)header.channel_length + header.nick_length +
+                          header.message_length;
+    if (header.magic != STORE_MAGIC || header.version != STORE_VERSION ||
+        header.type < MESSAGE_STORE_PRIVMSG || header.type > MESSAGE_STORE_NOTICE ||
+        header.channel_length > MESSAGE_STORE_CHANNEL_MAX ||
+        header.nick_length > MESSAGE_STORE_NICK_MAX ||
+        header.message_length > MESSAGE_STORE_MESSAGE_MAX ||
+        header.record_size != sizeof(header) + payload_size) return false;
+
+    record->type = (message_store_type_t)header.type;
+    record->timestamp_seconds = header.timestamp_seconds;
+    record->timestamp_microseconds = header.timestamp_microseconds;
+    if (fread(record->channel, header.channel_length, 1, file) != 1 ||
+        fread(record->nick, header.nick_length, 1, file) != 1 ||
+        fread(record->message, header.message_length, 1, file) != 1) return false;
+    record->channel[header.channel_length] = '\0';
+    record->nick[header.nick_length] = '\0';
+    record->message[header.message_length] = '\0';
+
+    stored_header_t crc_header = header;
+    crc_header.crc32 = 0;
+    uint32_t crc = crc32_update(UINT32_MAX, &crc_header, sizeof(crc_header));
+    crc = crc32_update(crc, record->channel, header.channel_length);
+    crc = crc32_update(crc, record->nick, header.nick_length);
+    crc = crc32_update(crc, record->message, header.message_length);
+    return (crc ^ UINT32_MAX) == header.crc32;
+}
+
+bool message_store_query(const char *channel, message_store_query_t query,
+                         int64_t reference_seconds, int32_t reference_microseconds,
+                         size_t limit, message_store_record_t *records,
+                         size_t *count, bool *more_available)
+{
+    if (!channel || !records || !count || !more_available || limit == 0 ||
+        query < MESSAGE_STORE_LATEST || query > MESSAGE_STORE_AFTER ||
+        wl_handle == WL_INVALID_HANDLE) return false;
+
+    unsigned current;
+    size_t ignored_size;
+    if (!load_current_segment(&current, &ignored_size)) return false;
+
+    size_t matched = 0;
+    for (unsigned step = 1; step <= STORE_SEGMENT_COUNT; ++step) {
+        unsigned segment = (current + step) % STORE_SEGMENT_COUNT;
+        FILE *file = open_segment(segment, "rb");
+        if (!file) continue;
+        message_store_record_t record;
+        while (read_record(file, &record)) {
+            if (strcasecmp(record.channel, channel) != 0 ||
+                !timestamp_matches(query, record.timestamp_seconds,
+                                   record.timestamp_microseconds,
+                                   reference_seconds, reference_microseconds)) continue;
+            if (matched < limit) {
+                records[matched] = record;
+            } else if (query != MESSAGE_STORE_AFTER) {
+                memmove(records, records + 1, (limit - 1) * sizeof(*records));
+                records[limit - 1] = record;
+            }
+            matched++;
+        }
+        fclose(file);
+    }
+    *more_available = matched > limit;
+    *count = matched < limit ? matched : limit;
     return true;
 }
