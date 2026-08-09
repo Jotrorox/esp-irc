@@ -4,11 +4,25 @@
 
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "lwip/sockets.h"
 #include <lwip/netdb.h>
 
+#if CONFIG_IRC_TLS_ENABLED
+#include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/version.h"
+#include "mbedtls/x509_crt.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include "psa/crypto.h"
+#endif
+#endif
+
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +55,12 @@ typedef struct irc_client {
     bool closing;
     unsigned pending_sends;
     SemaphoreHandle_t tx_lock;
+#if CONFIG_IRC_TLS_ENABLED
+    mbedtls_net_context tls_net;
+    mbedtls_ssl_context tls_ssl;
+    bool tls_initialized;
+    bool use_tls;
+#endif
     bool registered;
     bool cap_negotiating;
     bool cap_batch;
@@ -66,12 +86,26 @@ static irc_client_t clients[IRC_MAX_USERS];
 static irc_channel_t channels[IRC_MAX_CHANNELS];
 static SemaphoreHandle_t state_lock;
 
+#if CONFIG_IRC_TLS_ENABLED
+static mbedtls_ssl_config tls_config;
+static mbedtls_x509_crt tls_certificate;
+static mbedtls_pk_context tls_private_key;
+
+extern const unsigned char irc_tls_certificate_pem_start[]
+    asm("_binary_irc_tls_certificate_pem_start");
+extern const unsigned char irc_tls_certificate_pem_end[]
+    asm("_binary_irc_tls_certificate_pem_end");
+extern const unsigned char irc_tls_private_key_pem_start[]
+    asm("_binary_irc_tls_private_key_pem_start");
+extern const unsigned char irc_tls_private_key_pem_end[]
+    asm("_binary_irc_tls_private_key_pem_end");
+#endif
+
 static void lock_state(void) { xSemaphoreTake(state_lock, portMAX_DELAY); }
 static void unlock_state(void) { xSemaphoreGive(state_lock); }
 
 typedef struct {
     irc_client_t *client;
-    int socket;
     SemaphoreHandle_t tx_lock;
     bool cap_server_time;
 } recipient_t;
@@ -88,18 +122,49 @@ uint32_t irc_server_get_user_count(void)
     return count;
 }
 
-static bool send_all(int socket, const char *data, size_t length)
+static int transport_write(irc_client_t *client, const char *data, size_t length)
+{
+#if CONFIG_IRC_TLS_ENABLED
+    if (!client->use_tls)
+        return send(client->socket, data, length, 0);
+    int result = mbedtls_ssl_write(&client->tls_ssl,
+                                   (const unsigned char *)data, length);
+    if (result == MBEDTLS_ERR_SSL_WANT_READ ||
+        result == MBEDTLS_ERR_SSL_WANT_WRITE) return 0;
+    return result;
+#else
+    return send(client->socket, data, length, 0);
+#endif
+}
+
+static int transport_read(irc_client_t *client, char *data, size_t length)
+{
+#if CONFIG_IRC_TLS_ENABLED
+    if (!client->use_tls)
+        return recv(client->socket, data, length, 0);
+    int result = mbedtls_ssl_read(&client->tls_ssl, (unsigned char *)data,
+                                  length);
+    if (result == MBEDTLS_ERR_SSL_WANT_READ ||
+        result == MBEDTLS_ERR_SSL_WANT_WRITE) return -EAGAIN;
+    return result;
+#else
+    return recv(client->socket, data, length, 0);
+#endif
+}
+
+static bool send_all(irc_client_t *client, const char *data, size_t length)
 {
     while (length > 0) {
-        int sent = send(socket, data, length, 0);
-        if (sent <= 0) return false;
+        int sent = transport_write(client, data, length);
+        if (sent < 0) return false;
+        if (sent == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
         data += sent;
         length -= (size_t)sent;
     }
     return true;
 }
 
-static bool send_line_to_socket(SemaphoreHandle_t tx_lock, int socket,
+static bool send_line_to_client(SemaphoreHandle_t tx_lock, irc_client_t *client,
                                 const char *line)
 {
     char output[IRC_MAX_OUTPUT + 3];
@@ -108,7 +173,7 @@ static bool send_line_to_socket(SemaphoreHandle_t tx_lock, int socket,
     output[length++] = '\r';
     output[length++] = '\n';
     xSemaphoreTake(tx_lock, portMAX_DELAY);
-    bool sent = send_all(socket, output, length);
+    bool sent = send_all(client, output, length);
     xSemaphoreGive(tx_lock);
     return sent;
 }
@@ -116,10 +181,9 @@ static bool send_line_to_socket(SemaphoreHandle_t tx_lock, int socket,
 static bool send_line(irc_client_t *client, const char *line)
 {
     lock_state();
-    int socket = client->socket;
     SemaphoreHandle_t tx_lock = client->tx_lock;
     unlock_state();
-    return send_line_to_socket(tx_lock, socket, line);
+    return send_line_to_client(tx_lock, client, line);
 }
 
 static void format_timestamp(int64_t seconds, int32_t microseconds,
@@ -192,7 +256,6 @@ static size_t snapshot_recipients_locked(recipient_t *recipients,
         target->pending_sends++;
         recipients[count++] = (recipient_t) {
             .client = target,
-            .socket = target->socket,
             .tx_lock = target->tx_lock,
             .cap_server_time = target->cap_server_time,
         };
@@ -223,7 +286,6 @@ static void snapshot_client_locked(recipient_t *recipient, irc_client_t *client)
     client->pending_sends++;
     *recipient = (recipient_t) {
         .client = client,
-        .socket = client->socket,
         .tx_lock = client->tx_lock,
         .cap_server_time = client->cap_server_time,
     };
@@ -238,7 +300,7 @@ static void release_recipient(recipient_t *recipient)
 
 static void send_recipient(recipient_t *recipient, const char *line)
 {
-    send_line_to_socket(recipient->tx_lock, recipient->socket, line);
+    send_line_to_client(recipient->tx_lock, recipient->client, line);
     release_recipient(recipient);
 }
 
@@ -259,7 +321,10 @@ static bool valid_nick(const char *nick)
 {
     if (!nick[0] || !(isalpha((unsigned char)nick[0]) || strchr("[]\\`_^{|}", nick[0])))
         return false;
-    for (size_t i = 1; nick[i]; ++i)
+    for (size_t i = 1; nick[i]; ++i) {
+        if (!(isalnum((unsigned char)nick[i]) ||
+              strchr("-[]\\`_^{|}", nick[i]))) return false;
+    }
     return strlen(nick) < IRC_NICK_LEN;
 }
 
@@ -544,7 +609,12 @@ static void handle_whois(irc_client_t *client, const char *nick)
     char text[IRC_MAX_LINE];
     snprintf(text, sizeof(text), "%s %s esp.local * :%s", found_nick, user, realname); reply(client, 311, text);
     snprintf(text, sizeof(text), "%s %s :ESP IRC server", found_nick, IRC_SERVER_NAME); reply(client, 312, text);
-    if (channel_list[0]) { snprintf(text, sizeof(text), "%s :%s", found_nick, channel_list); reply(client, 319, text); }
+    if (channel_list[0]) {
+        int available = (int)sizeof(text) - (int)strlen(found_nick) - 3;
+        snprintf(text, sizeof(text), "%s :%.*s", found_nick, available,
+                 channel_list);
+        reply(client, 319, text);
+    }
     if (is_away) { snprintf(text, sizeof(text), "%s :%s", found_nick, away); reply(client, 301, text); }
     snprintf(text, sizeof(text), "%s :End of /WHOIS list", found_nick); reply(client, 318, text);
 }
@@ -869,8 +939,20 @@ static void disconnect_client(irc_client_t *client, const char *reason)
         unlock_state();
         if (pending_sends == 0) {
             xSemaphoreTake(tx_lock, portMAX_DELAY);
+#if CONFIG_IRC_TLS_ENABLED
+            if (client->use_tls && client->tls_initialized)
+                mbedtls_ssl_close_notify(&client->tls_ssl);
+#endif
             shutdown(socket, SHUT_RDWR);
             close(socket);
+#if CONFIG_IRC_TLS_ENABLED
+            if (client->use_tls && client->tls_initialized) {
+                client->tls_net.fd = -1; /* The socket was closed above. */
+                mbedtls_ssl_free(&client->tls_ssl);
+                mbedtls_net_free(&client->tls_net);
+                client->tls_initialized = false;
+            }
+#endif
             xSemaphoreGive(tx_lock);
             lock_state();
             memset(client, 0, sizeof(*client));
@@ -883,15 +965,124 @@ static void disconnect_client(irc_client_t *client, const char *reason)
     }
 }
 
+#if CONFIG_IRC_TLS_ENABLED
+static void log_tls_error(const char *operation, int error)
+{
+    char detail[128];
+    mbedtls_strerror(error, detail, sizeof(detail));
+    ESP_LOGE(TAG, "%s failed: -0x%04x (%s)", operation, (unsigned)-error,
+             detail);
+}
+
+#if MBEDTLS_VERSION_MAJOR < 4
+static int tls_random_bytes(void *context, unsigned char *output, size_t length)
+{
+    (void)context;
+    esp_fill_random(output, length);
+    return 0;
+}
+#endif
+
+static bool tls_server_init(void)
+{
+#if MBEDTLS_VERSION_MAJOR >= 4
+    psa_status_t psa_result = psa_crypto_init();
+    if (psa_result != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "PSA crypto initialization failed: %ld",
+                 (long)psa_result);
+        return false;
+    }
+#endif
+    mbedtls_ssl_config_init(&tls_config);
+    mbedtls_x509_crt_init(&tls_certificate);
+    mbedtls_pk_init(&tls_private_key);
+
+    int result = mbedtls_x509_crt_parse(
+        &tls_certificate, irc_tls_certificate_pem_start,
+        (size_t)(irc_tls_certificate_pem_end - irc_tls_certificate_pem_start));
+    if (result != 0) { log_tls_error("TLS certificate parsing", result); return false; }
+
+    result = mbedtls_pk_parse_key(
+        &tls_private_key, irc_tls_private_key_pem_start,
+        (size_t)(irc_tls_private_key_pem_end - irc_tls_private_key_pem_start),
+#if MBEDTLS_VERSION_MAJOR >= 4
+        NULL, 0);
+#else
+        NULL, 0, tls_random_bytes, NULL);
+#endif
+    if (result != 0) { log_tls_error("TLS private key parsing", result); return false; }
+
+    result = mbedtls_ssl_config_defaults(&tls_config, MBEDTLS_SSL_IS_SERVER,
+                                         MBEDTLS_SSL_TRANSPORT_STREAM,
+                                         MBEDTLS_SSL_PRESET_DEFAULT);
+    if (result != 0) { log_tls_error("TLS configuration", result); return false; }
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_ssl_conf_rng(&tls_config, tls_random_bytes, NULL);
+#endif
+    mbedtls_ssl_conf_min_tls_version(&tls_config, MBEDTLS_SSL_VERSION_TLS1_2);
+    result = mbedtls_ssl_conf_own_cert(&tls_config, &tls_certificate,
+                                      &tls_private_key);
+    if (result != 0) { log_tls_error("TLS certificate configuration", result); return false; }
+    return true;
+}
+
+static bool tls_client_handshake(irc_client_t *client)
+{
+    mbedtls_net_init(&client->tls_net);
+    mbedtls_ssl_init(&client->tls_ssl);
+    client->tls_net.fd = client->socket;
+    client->tls_initialized = true;
+
+    int result = mbedtls_ssl_setup(&client->tls_ssl, &tls_config);
+    if (result != 0) { log_tls_error("TLS session setup", result); return false; }
+    mbedtls_ssl_set_bio(&client->tls_ssl, &client->tls_net, mbedtls_net_send,
+                        mbedtls_net_recv, NULL);
+
+    int flags = fcntl(client->socket, F_GETFL, 0);
+    if (flags < 0 || fcntl(client->socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "Cannot make TLS client socket nonblocking: errno %d", errno);
+        return false;
+    }
+
+    int64_t deadline = esp_timer_get_time() +
+                       (int64_t)CONFIG_IRC_TLS_HANDSHAKE_TIMEOUT_MS * 1000;
+    do {
+        result = mbedtls_ssl_handshake(&client->tls_ssl);
+        if (result == 0) return true;
+        if (result != MBEDTLS_ERR_SSL_WANT_READ &&
+            result != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            log_tls_error("TLS handshake", result);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (esp_timer_get_time() < deadline);
+
+    ESP_LOGW(TAG, "TLS handshake timed out");
+    return false;
+}
+#endif
+
 static void irc_client_task(void *parameter)
 {
     irc_client_t *client = parameter;
-    lock_state();
-    int socket = client->socket;
-    unlock_state();
+#if CONFIG_IRC_TLS_ENABLED
+    if (client->use_tls && !tls_client_handshake(client)) {
+        disconnect_client(client, "TLS handshake failed");
+        vTaskDelete(NULL);
+        return;
+    }
+#endif
     char input[IRC_MAX_LINE + 1]; size_t used = 0;
     while (true) {
-        int received = recv(socket, input + used, IRC_MAX_LINE - used, 0);
+        xSemaphoreTake(client->tx_lock, portMAX_DELAY);
+        int received = transport_read(client, input + used, IRC_MAX_LINE - used);
+        xSemaphoreGive(client->tx_lock);
+#if CONFIG_IRC_TLS_ENABLED
+        if (client->use_tls && received == -EAGAIN) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+#endif
         if (received <= 0) break;
         used += (size_t)received; input[used] = '\0';
         char *start = input;
@@ -909,6 +1100,25 @@ static void irc_client_task(void *parameter)
     vTaskDelete(NULL);
 }
 
+static int create_listener(uint16_t port)
+{
+    int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (listener < 0) return -1;
+    int yes = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(listener, IRC_MAX_USERS) != 0) {
+        close(listener);
+        return -1;
+    }
+    return listener;
+}
+
 void irc_server_task(void *parameter)
 {
     (void)parameter;
@@ -924,18 +1134,55 @@ void irc_server_task(void *parameter)
         }
     }
 
-    int listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (listen_socket < 0) { ESP_LOGE(TAG, "socket failed: errno %d", errno); vTaskDelete(NULL); return; }
-    int yes = 1; setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = htonl(INADDR_ANY) };
-    if (bind(listen_socket, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(listen_socket, IRC_MAX_USERS) != 0) {
-        ESP_LOGE(TAG, "bind/listen failed: errno %d", errno); close(listen_socket); vTaskDelete(NULL); return;
+#if CONFIG_IRC_TLS_ENABLED
+    if (!tls_server_init()) { vTaskDelete(NULL); return; }
+#endif
+
+    int listen_socket = create_listener(PORT);
+    if (listen_socket < 0) {
+        ESP_LOGE(TAG, "Plaintext bind/listen on port %d failed: errno %d",
+                 PORT, errno);
+        vTaskDelete(NULL);
+        return;
     }
-    ESP_LOGI(TAG, "IRC server listening on port %d", PORT);
+    ESP_LOGI(TAG, "Plaintext IRC listening on port %d", PORT);
+#if CONFIG_IRC_TLS_ENABLED
+    int tls_listen_socket = create_listener(CONFIG_IRC_TLS_PORT);
+    if (tls_listen_socket < 0) {
+        ESP_LOGE(TAG, "TLS bind/listen on port %d failed: errno %d",
+                 CONFIG_IRC_TLS_PORT, errno);
+        close(listen_socket);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "TLS IRC listening on port %d", CONFIG_IRC_TLS_PORT);
+#endif
 
     while (true) {
+        fd_set listeners;
+        FD_ZERO(&listeners);
+        FD_SET(listen_socket, &listeners);
+        int highest_socket = listen_socket;
+#if CONFIG_IRC_TLS_ENABLED
+        FD_SET(tls_listen_socket, &listeners);
+        if (tls_listen_socket > highest_socket) highest_socket = tls_listen_socket;
+#endif
+        int selected = select(highest_socket + 1, &listeners, NULL, NULL, NULL);
+        if (selected < 0) {
+            ESP_LOGE(TAG, "listener select failed: errno %d", errno);
+            continue;
+        }
+
+        int ready_listener = listen_socket;
+        bool connection_uses_tls = false;
+#if CONFIG_IRC_TLS_ENABLED
+        if (FD_ISSET(tls_listen_socket, &listeners)) {
+            ready_listener = tls_listen_socket;
+            connection_uses_tls = true;
+        }
+#endif
         struct sockaddr_in source; socklen_t length = sizeof(source);
-        int socket_fd = accept(listen_socket, (struct sockaddr *)&source, &length);
+        int socket_fd = accept(ready_listener, (struct sockaddr *)&source, &length);
         if (socket_fd < 0) { ESP_LOGE(TAG, "accept failed: errno %d", errno); continue; }
         int keepalive = 1, idle = KEEPALIVE_IDLE, interval = KEEPALIVE_INTERVAL, count = KEEPALIVE_COUNT;
         setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
@@ -951,6 +1198,9 @@ void irc_server_task(void *parameter)
             client->tx_lock = tx_lock;
             client->used = true;
             client->socket = socket_fd;
+#if CONFIG_IRC_TLS_ENABLED
+            client->use_tls = connection_uses_tls;
+#endif
             break;
         }
         unlock_state();
@@ -965,11 +1215,14 @@ void irc_server_task(void *parameter)
                 client->tx_lock = tx_lock;
                 unlock_state();
             }
-            send_all(socket_fd, "ERROR :Server is full\r\n", 23); close(socket_fd);
+            if (!connection_uses_tls)
+                send(socket_fd, "ERROR :Server is full\r\n", 23, 0);
+            close(socket_fd);
         } else {
             char address_text[INET_ADDRSTRLEN];
             inet_ntoa_r(source.sin_addr, address_text, sizeof(address_text));
-            ESP_LOGI(TAG, "Client connected from %s", address_text);
+            ESP_LOGI(TAG, "%s client connected from %s",
+                     connection_uses_tls ? "TLS" : "Plaintext", address_text);
         }
     }
 }

@@ -987,6 +987,16 @@ CONFIG_DISPLAY_UPDATE_INTERVAL_MS=100
 # end of Display configuration
 
 #
+# IRC server configuration
+#
+CONFIG_IRC_TLS_ENABLED=y
+CONFIG_IRC_TLS_PORT=6697
+CONFIG_IRC_TLS_CERTIFICATE_PATH="main/certs/server.crt"
+CONFIG_IRC_TLS_PRIVATE_KEY_PATH="main/certs/server.key"
+CONFIG_IRC_TLS_HANDSHAKE_TIMEOUT_MS=15000
+# end of IRC server configuration
+
+#
 # Compiler options
 #
 # default:

@@ -22,3 +22,45 @@ menu "Display configuration"
         range 1 60000
 
 endmenu
+
+menu "IRC server configuration"
+
+    config IRC_TLS_ENABLED
+        bool "Enable an additional IRC over TLS listener"
+        default n
+        help
+            Add an implicit TLS listener using mbedTLS while keeping the
+            plaintext IRC listener active. This is not the IRC STARTTLS
+            extension.
+
+    config IRC_TLS_PORT
+        int "TLS listener port"
+        default 6697
+        range 1 65535
+        depends on IRC_TLS_ENABLED
+
+    config IRC_TLS_CERTIFICATE_PATH
+        string "Server certificate PEM file"
+        default "main/certs/server.crt"
+        depends on IRC_TLS_ENABLED
+        help
+            Path, relative to the project root, to the PEM encoded server
+            certificate followed by any intermediate certificates. The
+            certificate chain is embedded in the application.
+
+    config IRC_TLS_PRIVATE_KEY_PATH
+        string "Server private key PEM file"
+        default "main/certs/server.key"
+        depends on IRC_TLS_ENABLED
+        help
+            Path, relative to the project root, to the unencrypted PEM encoded
+            private key. The key is embedded in the application; protect the
+            firmware and source file appropriately.
+
+    config IRC_TLS_HANDSHAKE_TIMEOUT_MS
+        int "TLS handshake timeout (ms)"
+        default 15000
+        range 1000 120000
+        depends on IRC_TLS_ENABLED
+
+endmenu

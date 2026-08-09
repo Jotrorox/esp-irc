@@ -2,3 +2,5 @@ build/
 .vscode/
 sdkconfig.old
 main/config.h
+main/certs/*.key
+main/certs/*.crt
