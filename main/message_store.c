@@ -14,6 +14,7 @@
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "wear_levelling.h"
 
@@ -50,6 +51,7 @@ typedef struct __attribute__((packed)) {
 } stored_header_t;
 
 static QueueHandle_t store_queue;
+static SemaphoreHandle_t storage_lock;
 static wl_handle_t wl_handle = WL_INVALID_HANDLE;
 
 static uint32_t crc32_update(uint32_t crc, const void *data, size_t length)
@@ -161,7 +163,7 @@ static void store_task(void *parameter)
     (void)parameter;
     const esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = true,
-        .max_files = 2,
+        .max_files = 4,
         .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
         .use_one_fat = false,
     };
@@ -169,10 +171,12 @@ static void store_task(void *parameter)
         STORE_PATH, STORE_PARTITION, &mount_config, &wl_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Message storage unavailable: %s", esp_err_to_name(err));
+        xSemaphoreGive(storage_lock);
         queued_message_t discarded;
         while (true) xQueueReceive(store_queue, &discarded, portMAX_DELAY);
     }
 
+    xSemaphoreTake(storage_lock, portMAX_DELAY);
     size_t segment_size = 0;
     unsigned segment;
     if (!load_current_segment(&segment, &segment_size))
@@ -184,15 +188,18 @@ static void store_task(void *parameter)
     save_current_segment(segment);
     FILE *file = open_segment(segment, segment_size ? "ab" : "wb");
     if (!file) ESP_LOGE(TAG, "Cannot open message segment: errno %d", errno);
+    xSemaphoreGive(storage_lock);
 
     queued_message_t message;
     while (xQueueReceive(store_queue, &message, portMAX_DELAY) == pdTRUE) {
+        xSemaphoreTake(storage_lock, portMAX_DELAY);
         size_t record_size = sizeof(stored_header_t) + strlen(message.channel) +
                              strlen(message.nick) + strlen(message.message);
         if (!file) {
             file = open_segment(segment, "ab");
             if (!file) {
                 ESP_LOGE(TAG, "Cannot reopen message segment: errno %d", errno);
+                xSemaphoreGive(storage_lock);
                 continue;
             }
         }
@@ -203,6 +210,7 @@ static void store_task(void *parameter)
             file = open_segment(segment, "wb");
             if (!file) {
                 ESP_LOGE(TAG, "Cannot rotate message segment: errno %d", errno);
+                xSemaphoreGive(storage_lock);
                 continue;
             }
             save_current_segment(segment);
@@ -214,11 +222,17 @@ static void store_task(void *parameter)
             fclose(file);
             file = NULL;
         }
+        xSemaphoreGive(storage_lock);
     }
 }
 
 void message_store_init(void)
 {
+    storage_lock = xSemaphoreCreateMutex();
+    if (!storage_lock) {
+        ESP_LOGE(TAG, "Cannot allocate message storage mutex");
+        return;
+    }
     /* The backlog is intentionally placed in the XIAO's 8 MB octal PSRAM. */
     store_queue = xQueueCreateWithCaps(STORE_QUEUE_LENGTH,
                                       sizeof(queued_message_t),
@@ -232,6 +246,8 @@ void message_store_init(void)
         ESP_LOGE(TAG, "Cannot create message storage task");
         vQueueDeleteWithCaps(store_queue);
         store_queue = NULL;
+        vSemaphoreDelete(storage_lock);
+        storage_lock = NULL;
     }
 }
 
@@ -269,36 +285,50 @@ static bool timestamp_matches(message_store_query_t query,
            (query == MESSAGE_STORE_AFTER && comparison > 0);
 }
 
+/* Skips damaged bytes until the next complete, checksummed record or EOF. */
 static bool read_record(FILE *file, message_store_record_t *record)
 {
-    stored_header_t header;
-    if (fread(&header, sizeof(header), 1, file) != 1) return false;
-    size_t payload_size = (size_t)header.channel_length + header.nick_length +
-                          header.message_length;
-    if (header.magic != STORE_MAGIC || header.version != STORE_VERSION ||
-        header.type < MESSAGE_STORE_PRIVMSG || header.type > MESSAGE_STORE_NOTICE ||
-        header.channel_length > MESSAGE_STORE_CHANNEL_MAX ||
-        header.nick_length > MESSAGE_STORE_NICK_MAX ||
-        header.message_length > MESSAGE_STORE_MESSAGE_MAX ||
-        header.record_size != sizeof(header) + payload_size) return false;
+    bool recovering = false;
+    while (true) {
+        long record_offset = ftell(file);
+        stored_header_t header;
+        if (record_offset < 0 || fread(&header, sizeof(header), 1, file) != 1) return false;
+        size_t payload_size = (size_t)header.channel_length + header.nick_length +
+                              header.message_length;
+        bool valid_header = header.magic == STORE_MAGIC && header.version == STORE_VERSION &&
+            header.type >= MESSAGE_STORE_PRIVMSG && header.type <= MESSAGE_STORE_NOTICE &&
+            header.channel_length <= MESSAGE_STORE_CHANNEL_MAX &&
+            header.nick_length <= MESSAGE_STORE_NICK_MAX &&
+            header.message_length <= MESSAGE_STORE_MESSAGE_MAX &&
+            header.record_size == sizeof(header) + payload_size;
+        if (!valid_header) {
+            if (!recovering) ESP_LOGW(TAG, "Corrupt history record at offset %ld; scanning for next record", record_offset);
+            recovering = true;
+            if (fseek(file, record_offset + 1, SEEK_SET) != 0) return false;
+            continue;
+        }
 
-    record->type = (message_store_type_t)header.type;
-    record->timestamp_seconds = header.timestamp_seconds;
-    record->timestamp_microseconds = header.timestamp_microseconds;
-    if (fread(record->channel, header.channel_length, 1, file) != 1 ||
-        fread(record->nick, header.nick_length, 1, file) != 1 ||
-        fread(record->message, header.message_length, 1, file) != 1) return false;
-    record->channel[header.channel_length] = '\0';
-    record->nick[header.nick_length] = '\0';
-    record->message[header.message_length] = '\0';
+        record->type = (message_store_type_t)header.type;
+        record->timestamp_seconds = header.timestamp_seconds;
+        record->timestamp_microseconds = header.timestamp_microseconds;
+        if (fread(record->channel, header.channel_length, 1, file) != 1 ||
+            fread(record->nick, header.nick_length, 1, file) != 1 ||
+            fread(record->message, header.message_length, 1, file) != 1) return false;
+        record->channel[header.channel_length] = '\0';
+        record->nick[header.nick_length] = '\0';
+        record->message[header.message_length] = '\0';
 
-    stored_header_t crc_header = header;
-    crc_header.crc32 = 0;
-    uint32_t crc = crc32_update(UINT32_MAX, &crc_header, sizeof(crc_header));
-    crc = crc32_update(crc, record->channel, header.channel_length);
-    crc = crc32_update(crc, record->nick, header.nick_length);
-    crc = crc32_update(crc, record->message, header.message_length);
-    return (crc ^ UINT32_MAX) == header.crc32;
+        stored_header_t crc_header = header;
+        crc_header.crc32 = 0;
+        uint32_t crc = crc32_update(UINT32_MAX, &crc_header, sizeof(crc_header));
+        crc = crc32_update(crc, record->channel, header.channel_length);
+        crc = crc32_update(crc, record->nick, header.nick_length);
+        crc = crc32_update(crc, record->message, header.message_length);
+        if ((crc ^ UINT32_MAX) == header.crc32) return true;
+        if (!recovering) ESP_LOGW(TAG, "Bad history checksum at offset %ld; scanning for next record", record_offset);
+        recovering = true;
+        if (fseek(file, record_offset + 1, SEEK_SET) != 0) return false;
+    }
 }
 
 bool message_store_query(const char *channel, message_store_query_t query,
@@ -308,11 +338,20 @@ bool message_store_query(const char *channel, message_store_query_t query,
 {
     if (!channel || !records || !count || !more_available || limit == 0 ||
         query < MESSAGE_STORE_LATEST || query > MESSAGE_STORE_AFTER ||
-        wl_handle == WL_INVALID_HANDLE) return false;
+        !storage_lock) return false;
+
+    xSemaphoreTake(storage_lock, portMAX_DELAY);
+    if (wl_handle == WL_INVALID_HANDLE) {
+        xSemaphoreGive(storage_lock);
+        return false;
+    }
 
     unsigned current;
     size_t ignored_size;
-    if (!load_current_segment(&current, &ignored_size)) return false;
+    if (!load_current_segment(&current, &ignored_size)) {
+        xSemaphoreGive(storage_lock);
+        return false;
+    }
 
     size_t matched = 0;
     for (unsigned step = 1; step <= STORE_SEGMENT_COUNT; ++step) {
@@ -337,5 +376,6 @@ bool message_store_query(const char *channel, message_store_query_t query,
     }
     *more_available = matched > limit;
     *count = matched < limit ? matched : limit;
+    xSemaphoreGive(storage_lock);
     return true;
 }
