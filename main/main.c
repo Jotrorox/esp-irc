@@ -5,6 +5,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_psram.h"
 #include "nvs_flash.h"
 
 #include "lwip/err.h"
@@ -20,6 +21,8 @@
 #include "clock_sync.h"
 #include "message_store.h"
 
+#define NETWORK_CORE 0
+#define APPLICATION_CORE 1
 
 void app_main(void)
 {
@@ -32,16 +35,23 @@ void app_main(void)
     // Default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    ESP_LOGI("main", "XIAO ESP32-S3: %u MB PSRAM available, using CPU cores 0 and 1",
+             (unsigned int)(esp_psram_get_size() / (1024 * 1024)));
+
     clock_sync_init();
     message_store_init();
     wifi_init();
-    xTaskCreate(irc_server_task, "irc_server", 4096, (void*)AF_INET, 5, NULL);
-    BaseType_t display_task_created = xTaskCreate(
+    BaseType_t irc_task_created = xTaskCreatePinnedToCore(
+        irc_server_task, "irc_server", 4096, (void *)AF_INET, 5, NULL,
+        NETWORK_CORE);
+    ESP_ERROR_CHECK(irc_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    BaseType_t display_task_created = xTaskCreatePinnedToCore(
         display_task,
         "display",
         3072,
         NULL,
         4,
-        NULL);
+        NULL,
+        APPLICATION_CORE);
     ESP_ERROR_CHECK(display_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }

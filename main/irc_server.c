@@ -640,7 +640,9 @@ void irc_server_task(void *parameter)
         lock_state(); irc_client_t *client = NULL;
         for (int i = 0; i < IRC_MAX_USERS; ++i) if (!clients[i].used) { client = &clients[i]; memset(client, 0, sizeof(*client)); client->used = true; client->socket = socket_fd; break; }
         unlock_state();
-        if (!client || xTaskCreate(irc_client_task, "irc_client", IRC_CLIENT_STACK_SIZE, client, IRC_CLIENT_PRIORITY, NULL) != pdPASS) {
+        if (!client || xTaskCreatePinnedToCore(irc_client_task, "irc_client",
+                                               IRC_CLIENT_STACK_SIZE, client,
+                                               IRC_CLIENT_PRIORITY, NULL, 0) != pdPASS) {
             if (client) { lock_state(); memset(client, 0, sizeof(*client)); client->socket = -1; unlock_state(); }
             send_all(socket_fd, "ERROR :Server is full\r\n", 23); close(socket_fd);
         } else {

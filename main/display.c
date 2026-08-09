@@ -99,6 +99,16 @@ static esp_err_t display_i2c_init(i2c_master_bus_handle_t *bus,
         return err;
     }
 
+    err = i2c_master_probe(*bus, CONFIG_DISPLAY_I2C_ADDRESS, I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No display at I2C address 0x%02x on SDA GPIO %d/SCL GPIO %d",
+                 CONFIG_DISPLAY_I2C_ADDRESS, CONFIG_DISPLAY_I2C_SDA_GPIO,
+                 CONFIG_DISPLAY_I2C_SCL_GPIO);
+        i2c_del_master_bus(*bus);
+        *bus = NULL;
+        return err;
+    }
+
     i2c_device_config_t device_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = CONFIG_DISPLAY_I2C_ADDRESS,

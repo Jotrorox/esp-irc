@@ -140,13 +140,14 @@ void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    BaseType_t task_created = xTaskCreate(
+    BaseType_t task_created = xTaskCreatePinnedToCore(
         wifi_health_task,
         "wifi_health",
         3072,
         NULL,
         4,
-        NULL);
+        NULL,
+        0);
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_LOGI(TAG, "Wi-Fi initialization finished");

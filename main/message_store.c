@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -21,8 +22,8 @@
 #define STORE_PATH "/store"
 #define STORE_PARTITION "storage"
 #define STORE_TASK_STACK 4096
-#define STORE_QUEUE_LENGTH 16
-#define STORE_SEGMENT_COUNT 24
+#define STORE_QUEUE_LENGTH 64
+#define STORE_SEGMENT_COUNT 44
 #define STORE_SEGMENT_SIZE (128 * 1024)
 #define STORE_MAGIC 0x43495245U /* "ERIC", stored little-endian */
 #define STORE_VERSION 1
@@ -218,14 +219,18 @@ static void store_task(void *parameter)
 
 void message_store_init(void)
 {
-    store_queue = xQueueCreate(STORE_QUEUE_LENGTH, sizeof(queued_message_t));
+    /* The backlog is intentionally placed in the XIAO's 8 MB octal PSRAM. */
+    store_queue = xQueueCreateWithCaps(STORE_QUEUE_LENGTH,
+                                      sizeof(queued_message_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!store_queue) {
         ESP_LOGE(TAG, "Cannot allocate message storage queue");
         return;
     }
-    if (xTaskCreate(store_task, "message_store", STORE_TASK_STACK, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(store_task, "message_store", STORE_TASK_STACK,
+                                NULL, 3, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Cannot create message storage task");
-        vQueueDelete(store_queue);
+        vQueueDeleteWithCaps(store_queue);
         store_queue = NULL;
     }
 }

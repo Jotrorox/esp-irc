@@ -2,11 +2,11 @@ menu "Display configuration"
 
     config DISPLAY_I2C_SDA_GPIO
         int "I2C SDA GPIO"
-        default 6
+        default 5
 
     config DISPLAY_I2C_SCL_GPIO
         int "I2C SCL GPIO"
-        default 7
+        default 6
 
     config DISPLAY_I2C_FREQUENCY
         int "I2C clock frequency (Hz)"
