@@ -43,9 +43,9 @@
 #define IRC_USER_LEN           24
 #define IRC_REALNAME_LEN       48
 #define IRC_CHANNEL_LEN        32
-#define IRC_CLIENT_STACK_SIZE  6144
+/* TLS handshakes require considerably more stack than plaintext clients. */
+#define IRC_CLIENT_STACK_SIZE  12288
 #define IRC_CLIENT_PRIORITY    5
-#define IRC_SERVER_NAME        "esp-irc"
 #define IRC_MAX_OUTPUT         768
 #define IRC_HISTORY_LIMIT      50
 
@@ -356,6 +356,16 @@ static void send_names(irc_client_t *client, int channel_index)
     reply(client, 366, text);
 }
 
+static void send_motd(irc_client_t *client)
+{
+    char text[IRC_MAX_LINE];
+    snprintf(text, sizeof(text), ":- %s Message of the Day -", IRC_SERVER_NAME);
+    reply(client, 375, text);
+    snprintf(text, sizeof(text), ":- %s", IRC_MOTD);
+    reply(client, 372, text);
+    reply(client, 376, ":End of /MOTD command");
+}
+
 static void complete_registration(irc_client_t *client)
 {
     char nick[IRC_NICK_LEN], user[IRC_USER_LEN];
@@ -370,15 +380,15 @@ static void complete_registration(irc_client_t *client)
     strlcpy(user, client->user, sizeof(user));
     unlock_state();
     char text[IRC_MAX_LINE];
-    snprintf(text, sizeof(text), ":Welcome to ESP IRC, %s!%s@esp.local", nick, user);
+    snprintf(text, sizeof(text), ":Welcome to %s, %s!%s@%s", IRC_SERVER_NAME, nick, user, IRC_SERVER_NAME);
     reply(client, 1, text);
-    reply(client, 2, ":Your host is esp-irc, running version 1.0");
+    snprintf(text, sizeof(text), ":Your host is %s, running version 1.0", IRC_SERVER_NAME);
+    reply(client, 2, text);
     reply(client, 3, ":This server was created for ESP-IDF");
-    reply(client, 4, "esp-irc 1.0 io nt");
+    snprintf(text, sizeof(text), "%s 1.0 io nt", IRC_SERVER_NAME);
+    reply(client, 4, text);
     reply(client, 5, "CHANTYPES=# NICKLEN=23 CHANNELLEN=31 CASEMAPPING=ascii NETWORK=ESPIRC CHATHISTORY=50 MSGREFTYPES=timestamp :are supported by this server");
-    reply(client, 375, ":- esp-irc Message of the Day -");
-    reply(client, 372, ":- A tiny IRC server running on an ESP32.");
-    reply(client, 376, ":End of /MOTD command");
+    send_motd(client);
 }
 
 static void handle_nick(irc_client_t *client, char *nick)
@@ -908,8 +918,13 @@ static void handle_command(irc_client_t *client, char *line)
     if (!strcasecmp(command, "WHO")) { handle_who(client, param); return; }
     if (!strcasecmp(command, "WHOIS")) { handle_whois(client, param); return; }
     if (!strcasecmp(command, "AWAY")) { handle_away(client, has_colon_parameter ? trailing : NULL); return; }
-    if (!strcasecmp(command, "MOTD")) { reply(client, 372, ":- A tiny IRC server running on an ESP32."); reply(client, 376, ":End of /MOTD command"); return; }
-    if (!strcasecmp(command, "VERSION")) { reply(client, 351, "esp-irc-1.0 esp-irc :ESP-IDF IRC server"); return; }
+    if (!strcasecmp(command, "MOTD")) { send_motd(client); return; }
+    if (!strcasecmp(command, "VERSION")) {
+        char text[IRC_MAX_LINE];
+        snprintf(text, sizeof(text), "esp-irc-1.0 %s :ESP-IDF IRC server", IRC_SERVER_NAME);
+        reply(client, 351, text);
+        return;
+    }
     reply(client, 421, ":Unknown command");
 }
 
