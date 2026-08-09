@@ -17,6 +17,8 @@
 #include "wifi.h"
 #include "irc_server.h"
 #include "display.h"
+#include "clock_sync.h"
+#include "message_store.h"
 
 
 void app_main(void)
@@ -30,6 +32,8 @@ void app_main(void)
     // Default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    clock_sync_init();
+    message_store_init();
     wifi_init();
     xTaskCreate(irc_server_task, "irc_server", 4096, (void*)AF_INET, 5, NULL);
     BaseType_t display_task_created = xTaskCreate(

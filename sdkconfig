@@ -1002,11 +1002,11 @@ CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 # default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
 # default:
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
 # default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
 # default:
-# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 # default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
 # default:
@@ -1016,7 +1016,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
 # default:
 # CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
 # default:
-CONFIG_ESPTOOLPY_FLASHSIZE="2MB"
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 # default:
 # CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE is not set
 # default:
@@ -1077,9 +1077,9 @@ CONFIG_DISPLAY_UPDATE_INTERVAL_MS=100
 # Compiler options
 #
 # default:
-CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+# CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
 # default:
-# CONFIG_COMPILER_OPTIMIZATION_SIZE is not set
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # default:
 # CONFIG_COMPILER_OPTIMIZATION_PERF is not set
 # default:
@@ -1201,7 +1201,7 @@ CONFIG_ESP_ERR_TO_NAME_LOOKUP=y
 # GDMA Configurations
 #
 # default:
-# CONFIG_GDMA_CTRL_FUNC_IN_IRAM is not set
+CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
 # default:
 CONFIG_GDMA_ISR_HANDLER_IN_IRAM=y
 # default:
@@ -1227,6 +1227,17 @@ CONFIG_GDMA_OBJ_DRAM_SAFE=y
 # default:
 CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=y
 # end of ESP-Driver:I2C Configurations
+
+#
+# ESP-Driver:SPI Configurations
+#
+# default:
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+# default:
+# CONFIG_SPI_SLAVE_IN_IRAM is not set
+# default:
+CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
+# end of ESP-Driver:SPI Configurations
 
 #
 # ESP-Driver:UART Configurations
@@ -1421,6 +1432,8 @@ CONFIG_ESP_BROWNOUT_USE_INTR=y
 # end of Brownout Detector
 # end of Power Supplier
 
+# default:
+CONFIG_ESP_SPI_BUS_LOCK_ISR_FUNCS_IN_IRAM=y
 # default:
 # CONFIG_ESP_ENABLE_PVT is not set
 # default:
@@ -1883,6 +1896,108 @@ CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=y
 # end of Wi-Fi
 
 #
+# FAT Filesystem support
+#
+# default:
+CONFIG_FATFS_VOLUME_COUNT=2
+# default:
+# CONFIG_FATFS_LFN_NONE is not set
+# default:
+CONFIG_FATFS_LFN_HEAP=y
+# default:
+# CONFIG_FATFS_LFN_STACK is not set
+# default:
+# CONFIG_FATFS_SECTOR_512 is not set
+# default:
+CONFIG_FATFS_SECTOR_4096=y
+# default:
+# CONFIG_FATFS_CODEPAGE_DYNAMIC is not set
+# default:
+CONFIG_FATFS_CODEPAGE_437=y
+# default:
+# CONFIG_FATFS_CODEPAGE_720 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_737 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_771 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_775 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_850 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_852 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_855 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_857 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_860 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_861 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_862 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_863 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_864 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_865 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_866 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_869 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_932 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_936 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_949 is not set
+# default:
+# CONFIG_FATFS_CODEPAGE_950 is not set
+# default:
+CONFIG_FATFS_CODEPAGE=437
+# default:
+CONFIG_FATFS_MAX_LFN=255
+# default:
+CONFIG_FATFS_API_ENCODING_ANSI_OEM=y
+# default:
+# CONFIG_FATFS_API_ENCODING_UTF_8 is not set
+# default:
+CONFIG_FATFS_FS_LOCK=0
+# default:
+CONFIG_FATFS_TIMEOUT_MS=10000
+# default:
+CONFIG_FATFS_PER_FILE_CACHE=y
+# default:
+# CONFIG_FATFS_USE_FASTSEEK is not set
+# default:
+CONFIG_FATFS_USE_STRFUNC_NONE=y
+# default:
+# CONFIG_FATFS_USE_STRFUNC_WITHOUT_CRLF_CONV is not set
+# default:
+# CONFIG_FATFS_USE_STRFUNC_WITH_CRLF_CONV is not set
+# default:
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
+# default:
+# CONFIG_FATFS_IMMEDIATE_FSYNC is not set
+# default:
+# CONFIG_FATFS_USE_LABEL is not set
+# default:
+CONFIG_FATFS_LINK_LOCK=y
+# default:
+CONFIG_FATFS_USE_DYN_BUFFERS=y
+
+#
+# File system free space calculation behavior
+#
+# default:
+CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT=0
+# default:
+CONFIG_FATFS_DONT_TRUST_LAST_ALLOC=0
+# end of File system free space calculation behavior
+# end of FAT Filesystem support
+
+#
 # FreeRTOS
 #
 
@@ -1948,8 +2063,6 @@ CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES=1
 #
 # Port
 #
-# default:
-CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER=y
 # default:
 # CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK is not set
 # default:
@@ -2849,14 +2962,21 @@ CONFIG_PTHREAD_TASK_NAME_DEFAULT="pthread"
 # end of PThreads
 
 #
+# SD Protocol Layer Configuration
+#
+# default:
+CONFIG_SD_ENABLE_SDIO_SUPPORT=y
+# end of SD Protocol Layer Configuration
+
+#
 # MMU Config
 #
 # default:
-CONFIG_MMU_PAGE_SIZE_32KB=y
+CONFIG_MMU_PAGE_SIZE_64KB=y
 # default:
-CONFIG_MMU_PAGE_MODE="32KB"
+CONFIG_MMU_PAGE_MODE="64KB"
 # default:
-CONFIG_MMU_PAGE_SIZE=0x8000
+CONFIG_MMU_PAGE_SIZE=0x10000
 # end of MMU Config
 
 #
@@ -2979,6 +3099,23 @@ CONFIG_VFS_SEMIHOSTFS_MAX_MOUNT_POINTS=1
 # default:
 CONFIG_VFS_INITIALIZE_DEV_NULL=y
 # end of Virtual file system
+
+#
+# Wear Levelling
+#
+# default:
+CONFIG_WL_SECTOR_SIZE_512=y
+# default:
+# CONFIG_WL_SECTOR_SIZE_4096 is not set
+# default:
+CONFIG_WL_SECTOR_SIZE=512
+# default:
+# CONFIG_WL_SECTOR_MODE_PERF is not set
+# default:
+CONFIG_WL_SECTOR_MODE_SAFE=y
+# default:
+CONFIG_WL_SECTOR_MODE=1
+# end of Wear Levelling
 # end of Component config
 
 # default:
@@ -3002,11 +3139,11 @@ CONFIG_LOG_BOOTLOADER_LEVEL=3
 CONFIG_FLASHMODE_DIO=y
 # CONFIG_FLASHMODE_DOUT is not set
 CONFIG_MONITOR_BAUD=115200
-CONFIG_OPTIMIZATION_LEVEL_DEBUG=y
-CONFIG_COMPILER_OPTIMIZATION_LEVEL_DEBUG=y
-CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y
-# CONFIG_OPTIMIZATION_LEVEL_RELEASE is not set
-# CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE is not set
+# CONFIG_OPTIMIZATION_LEVEL_DEBUG is not set
+# CONFIG_COMPILER_OPTIMIZATION_LEVEL_DEBUG is not set
+# CONFIG_COMPILER_OPTIMIZATION_DEFAULT is not set
+CONFIG_OPTIMIZATION_LEVEL_RELEASE=y
+CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE=y
 CONFIG_OPTIMIZATION_ASSERTIONS_ENABLED=y
 # CONFIG_OPTIMIZATION_ASSERTIONS_SILENT is not set
 # CONFIG_OPTIMIZATION_ASSERTIONS_DISABLED is not set

@@ -1,5 +1,5 @@
 idf_component_register(SRCS "main.c" "wifi.c" "irc_server.c" "display.c"
-                       PRIV_REQUIRES nvs_flash
-                       PRIV_REQUIRES esp_wifi
-                       PRIV_REQUIRES esp_driver_i2c
+                            "clock_sync.c" "message_store.c"
+                       PRIV_REQUIRES nvs_flash esp_wifi esp_driver_i2c
+                                     fatfs wear_levelling esp_netif
                        INCLUDE_DIRS ".")

@@ -17,6 +17,7 @@
 
 #include "config.h"
 #include "irc_server.h"
+#include "message_store.h"
 
 #define IRC_MAX_USERS          16
 #define IRC_MAX_CHANNELS       8
@@ -235,6 +236,8 @@ static void handle_message(irc_client_t *client, char *target, char *message, bo
     if (target[0] == '#') {
         int index = find_channel_locked(target);
         if (index < 0 || !client->joined[index]) { unlock_state(); if (!notice) reply(client, 404, "* :Cannot send to channel"); return; }
+        message_store_enqueue(notice ? MESSAGE_STORE_NOTICE : MESSAGE_STORE_PRIVMSG,
+                              channels[index].name, client->nick, message);
         broadcast_locked(line, client, index);
     } else {
         irc_client_t *recipient = NULL;
