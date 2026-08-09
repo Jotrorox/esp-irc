@@ -2,6 +2,9 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -163,4 +166,24 @@ bool wifi_get_ip_address(char *buffer, size_t buffer_size)
     esp_ip4_addr_t ip = wifi_ip_address;
     snprintf(buffer, buffer_size, IPSTR, IP2STR(&ip));
     return true;
+}
+
+void wifi_get_status(wifi_status_t *status)
+{
+    if (status == NULL) {
+        return;
+    }
+
+    memset(status, 0, sizeof(*status));
+    status->connected = wifi_get_ip_address(status->ip_address,
+                                             sizeof(status->ip_address));
+    if (!status->connected) {
+        return;
+    }
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        status->rssi = ap_info.rssi;
+        status->channel = ap_info.primary;
+    }
 }

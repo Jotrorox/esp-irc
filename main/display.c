@@ -2,17 +2,23 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "driver/i2c_master.h"
 
+#include "clock_sync.h"
+#include "config.h"
 #include "irc_server.h"
 #include "wifi.h"
 
+#undef TAG
 static const char *TAG = "display";
 
 #define DISPLAY_WIDTH  128
@@ -184,21 +190,65 @@ static void draw_wifi_icon(int x, int y, bool connected)
     }
 }
 
-static void compose_screen(bool connected, const char *ip_address, uint32_t users)
+static void draw_horizontal_line(int y)
+{
+    for (int x = 0; x < DISPLAY_WIDTH; ++x) {
+        set_pixel(x, y);
+    }
+}
+
+static void compose_screen(const wifi_status_t *wifi, uint32_t users,
+                           uint32_t free_heap, uint64_t uptime_seconds)
 {
     memset(framebuffer, 0, sizeof(framebuffer));
-    draw_wifi_icon(2, 2, connected);
-    draw_text(15, 2, connected ? ip_address : "DISCONNECTED", 1);
-    for (int x = 0; x < DISPLAY_WIDTH; ++x) {
-        set_pixel(x, 12);
+
+    char line[48];
+    uint64_t days = uptime_seconds / 86400;
+    uint64_t hours = (uptime_seconds / 3600) % 24;
+    uint64_t minutes = (uptime_seconds / 60) % 60;
+    if (days > 0) {
+        snprintf(line, sizeof(line), "ESP-IRC UP %lluD%02lluH",
+                 (unsigned long long)days, (unsigned long long)hours);
+    } else {
+        snprintf(line, sizeof(line), "ESP-IRC UP %02llu:%02llu",
+                 (unsigned long long)hours, (unsigned long long)minutes);
     }
+    draw_text(1, 1, line, 1);
+    draw_horizontal_line(10);
 
-    draw_text(19, 20, "CONNECTED USERS", 1);
+    draw_wifi_icon(2, 14, wifi->connected);
+    draw_text(15, 14, wifi->connected ? wifi->ip_address : "WIFI DISCONNECTED", 1);
 
-    char count[11];
-    snprintf(count, sizeof(count), "%lu", (unsigned long)users);
-    int count_width = (int)strlen(count) * 18 - 3;
-    draw_text((DISPLAY_WIDTH - count_width) / 2, 36, count, 3);
+    if (wifi->connected) {
+        snprintf(line, sizeof(line), "SIGNAL %dDBM CH %u", wifi->rssi,
+                 (unsigned int)wifi->channel);
+    } else {
+        snprintf(line, sizeof(line), "WAITING TO RECONNECT");
+    }
+    draw_text(2, 25, line, 1);
+
+    snprintf(line, sizeof(line), "USERS %lu  MEM %luKB", (unsigned long)users,
+             (unsigned long)(free_heap / 1024));
+    draw_text(2, 36, line, 1);
+
+#if CONFIG_IRC_TLS_ENABLED
+    snprintf(line, sizeof(line), "IRC %d  TLS %d", PORT, CONFIG_IRC_TLS_PORT);
+#else
+    snprintf(line, sizeof(line), "IRC PORT %d", PORT);
+#endif
+    draw_text(2, 47, line, 1);
+
+    int64_t seconds;
+    if (clock_sync_now(&seconds, NULL)) {
+        time_t timestamp = (time_t)seconds;
+        struct tm utc;
+        gmtime_r(&timestamp, &utc);
+        snprintf(line, sizeof(line), "UTC %02d:%02d:%02d", utc.tm_hour,
+                 utc.tm_min, utc.tm_sec);
+    } else {
+        snprintf(line, sizeof(line), "UTC SYNCING");
+    }
+    draw_text(2, 57, line, 1);
 }
 
 static esp_err_t display_flush(i2c_master_dev_handle_t device)
@@ -241,25 +291,20 @@ void display_task(void *pvParameters)
     }
 
     ESP_LOGI(TAG, "SSD1306/SSD1309 display initialized");
-    bool previous_connected = false;
-    uint32_t previous_users = UINT32_MAX;
-    char previous_ip[16] = "";
+    uint64_t previous_uptime = UINT64_MAX;
 
     while (1) {
-        char ip_address[16] = "";
-        bool connected = wifi_get_ip_address(ip_address, sizeof(ip_address));
-        uint32_t users = irc_server_get_user_count();
-
-        if (connected != previous_connected || users != previous_users ||
-            strcmp(ip_address, previous_ip) != 0) {
-            compose_screen(connected, ip_address, users);
+        uint64_t uptime = (uint64_t)(esp_timer_get_time() / 1000000);
+        if (uptime != previous_uptime) {
+            wifi_status_t wifi;
+            wifi_get_status(&wifi);
+            compose_screen(&wifi, irc_server_get_user_count(),
+                           esp_get_free_heap_size(), uptime);
             err = display_flush(device);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Display update failed: %s", esp_err_to_name(err));
             }
-            previous_connected = connected;
-            previous_users = users;
-            snprintf(previous_ip, sizeof(previous_ip), "%s", ip_address);
+            previous_uptime = uptime;
         }
         vTaskDelay(pdMS_TO_TICKS(CONFIG_DISPLAY_UPDATE_INTERVAL_MS));
     }
