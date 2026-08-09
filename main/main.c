@@ -16,6 +16,7 @@
 
 #include "wifi.h"
 #include "irc_server.h"
+#include "display.h"
 
 
 void app_main(void)
@@ -31,4 +32,12 @@ void app_main(void)
 
     wifi_init();
     xTaskCreate(irc_server_task, "irc_server", 4096, (void*)AF_INET, 5, NULL);
+    BaseType_t display_task_created = xTaskCreate(
+        display_task,
+        "display",
+        3072,
+        NULL,
+        4,
+        NULL);
+    ESP_ERROR_CHECK(display_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }

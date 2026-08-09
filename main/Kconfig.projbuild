@@ -1,0 +1,24 @@
+menu "Display configuration"
+
+    config DISPLAY_I2C_SDA_GPIO
+        int "I2C SDA GPIO"
+        default 6
+
+    config DISPLAY_I2C_SCL_GPIO
+        int "I2C SCL GPIO"
+        default 7
+
+    config DISPLAY_I2C_FREQUENCY
+        int "I2C clock frequency (Hz)"
+        default 100000
+
+    config DISPLAY_I2C_ADDRESS
+        hex "Display I2C address"
+        default 0x3C
+
+    config DISPLAY_UPDATE_INTERVAL_MS
+        int "Display task update interval (ms)"
+        default 100
+        range 1 60000
+
+endmenu

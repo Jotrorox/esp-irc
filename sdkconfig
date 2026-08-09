@@ -1059,6 +1059,21 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# Display configuration
+#
+# default:
+CONFIG_DISPLAY_I2C_SDA_GPIO=6
+# default:
+CONFIG_DISPLAY_I2C_SCL_GPIO=7
+# default:
+CONFIG_DISPLAY_I2C_FREQUENCY=100000
+# default:
+CONFIG_DISPLAY_I2C_ADDRESS=0x3C
+# default:
+CONFIG_DISPLAY_UPDATE_INTERVAL_MS=100
+# end of Display configuration
+
+#
 # Compiler options
 #
 # default:
@@ -1201,6 +1216,17 @@ CONFIG_GDMA_OBJ_DRAM_SAFE=y
 # default:
 # CONFIG_GPIO_CTRL_FUNC_IN_IRAM is not set
 # end of ESP-Driver:GPIO Configurations
+
+#
+# ESP-Driver:I2C Configurations
+#
+# default:
+# CONFIG_I2C_ISR_IRAM_SAFE is not set
+# default:
+# CONFIG_I2C_ENABLE_DEBUG_LOG is not set
+# default:
+CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=y
+# end of ESP-Driver:I2C Configurations
 
 #
 # ESP-Driver:UART Configurations
