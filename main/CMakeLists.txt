@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "wifi.c" "irc_server.c" "display.c"
+idf_component_register(SRCS "main.c" "wifi.c" "irc_server.c" "display.c" "display_navigation.c"
                             "clock_sync.c" "message_store.c"
                        PRIV_REQUIRES nvs_flash esp_wifi esp_lcd esp_driver_gpio
                                      fatfs wear_levelling esp_netif esp_psram

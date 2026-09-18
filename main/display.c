@@ -20,6 +20,7 @@
 
 #include "clock_sync.h"
 #include "config.h"
+#include "display_navigation.h"
 #include "irc_server.h"
 #include "wifi.h"
 
@@ -40,6 +41,9 @@ static const char *TAG = "display";
 #define LCD_DC_GPIO         7
 #define LCD_WR_GPIO         8
 #define LCD_RD_GPIO         9
+#define BUTTON_PREVIOUS_GPIO 0
+#define BUTTON_NEXT_GPIO     14
+#define BUTTON_POLL_MS       10
 
 #define COLOR_BACKGROUND 0x0841
 #define COLOR_CARD       0x10c3
@@ -56,8 +60,8 @@ static esp_lcd_i80_bus_handle_t lcd_bus;
 static esp_lcd_panel_io_handle_t lcd_io;
 static esp_lcd_panel_handle_t lcd_panel;
 
-/* 5x7 glyphs for 0-9, A-Z, '.', ':', and '-'. */
-static const char glyph_characters[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-";
+/* 5x7 glyphs for 0-9, A-Z and navigation punctuation. */
+static const char glyph_characters[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-/<>";
 static const uint8_t glyphs[][5] = {
     {0x3e,0x51,0x49,0x45,0x3e},{0x00,0x42,0x7f,0x40,0x00},
     {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4b,0x31},
@@ -79,6 +83,8 @@ static const uint8_t glyphs[][5] = {
     {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},
     {0x00,0x60,0x60,0x00,0x00},{0x00,0x36,0x36,0x00,0x00},
     {0x08,0x08,0x08,0x08,0x08},
+    {0x20,0x10,0x08,0x04,0x02},{0x08,0x14,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x14,0x08},
 };
 
 static bool display_transfer_done(esp_lcd_panel_io_handle_t io,
@@ -243,7 +249,8 @@ static void draw_text(int x, int y, const char *text, int scale, uint16_t color)
 
 static void draw_wifi_icon(int x, int y, const wifi_status_t *wifi)
 {
-    int bars = !wifi->connected ? 0 : wifi->rssi >= -60 ? 3 : wifi->rssi >= -75 ? 2 : 1;
+    int bars = !wifi->connected || wifi->channel == 0 ? 0 :
+               wifi->rssi >= -60 ? 3 : wifi->rssi >= -75 ? 2 : 1;
     for (int i = 0; i < 3; ++i) {
         int height = 6 + i * 5;
         fill_rectangle(x + i * 7, y + 16 - height, 5, height,
@@ -257,65 +264,154 @@ static void draw_wifi_icon(int x, int y, const wifi_status_t *wifi)
     }
 }
 
-static void compose_screen(const wifi_status_t *wifi, uint32_t users,
-                           uint32_t free_heap, uint64_t uptime_seconds)
+static void format_uptime(char *buffer, size_t size, uint64_t seconds)
 {
-    fill_rectangle(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, COLOR_BACKGROUND);
-    draw_text(12, 10, "ESP-IRC", 2, COLOR_ACCENT);
-
-    char line[48];
-    uint64_t days = uptime_seconds / 86400;
-    uint64_t hours = (uptime_seconds / 3600) % 24;
-    uint64_t minutes = (uptime_seconds / 60) % 60;
+    unsigned long long days = seconds / 86400;
+    unsigned int hours = (seconds / 3600) % 24;
+    unsigned int minutes = (seconds / 60) % 60;
     if (days > 0) {
-        snprintf(line, sizeof(line), "UP %lluD %02lluH",
-                 (unsigned long long)days, (unsigned long long)hours);
+        snprintf(buffer, size, "UP %lluD %02u:%02u", days, hours, minutes);
     } else {
-        snprintf(line, sizeof(line), "UP %02llu:%02llu",
-                 (unsigned long long)hours, (unsigned long long)minutes);
+        snprintf(buffer, size, "UP %02u:%02u:%02u", hours, minutes,
+                 (unsigned int)(seconds % 60));
     }
-    draw_text(DISPLAY_WIDTH - 12 - (int)strlen(line) * 6, 14, line, 1, COLOR_MUTED);
-    fill_rectangle(12, 32, 296, 1, COLOR_MUTED);
+}
 
+static bool get_utc(struct tm *utc)
+{
+    int64_t seconds;
+    if (!clock_sync_now(&seconds, NULL)) return false;
+    time_t timestamp = (time_t)seconds;
+    return gmtime_r(&timestamp, utc) != NULL;
+}
+
+static void draw_card(int x, int y, int height, const char *label,
+                      const char *value, uint16_t color)
+{
+    fill_rectangle(x, y, 144, height, COLOR_CARD);
+    draw_text(x + 10, y + 7, label, 1, COLOR_MUTED);
+    draw_text(x + 10, y + 21, value, 2, color);
+}
+
+static void format_signal(char *buffer, size_t size, const wifi_status_t *wifi)
+{
+    if (!wifi->connected) {
+        snprintf(buffer, size, "RECONNECTING AUTOMATICALLY");
+    } else if (wifi->channel == 0) {
+        snprintf(buffer, size, "READING SIGNAL");
+    } else {
+        snprintf(buffer, size, "SIGNAL %d DBM   CHANNEL %u", wifi->rssi,
+                 (unsigned int)wifi->channel);
+    }
+}
+
+static void compose_overview(const wifi_status_t *wifi, uint32_t users,
+                             uint32_t free_heap, uint64_t uptime_seconds)
+{
+    char line[48];
     draw_wifi_icon(12, 45, wifi);
     draw_text(42, 44, wifi->connected ? wifi->ip_address : "WIFI DISCONNECTED",
               2, wifi->connected ? COLOR_ONLINE : COLOR_OFFLINE);
-    if (wifi->connected) {
-        snprintf(line, sizeof(line), "SIGNAL %d DBM   CHANNEL %u", wifi->rssi,
-                 (unsigned int)wifi->channel);
-    } else {
-        snprintf(line, sizeof(line), "WAITING TO RECONNECT");
-    }
+    format_signal(line, sizeof(line), wifi);
     draw_text(42, 66, line, 1, COLOR_MUTED);
 
-    fill_rectangle(12, 84, 142, 47, COLOR_CARD);
-    fill_rectangle(164, 84, 144, 47, COLOR_CARD);
-    draw_text(22, 92, "CONNECTED USERS", 1, COLOR_MUTED);
     snprintf(line, sizeof(line), "%lu", (unsigned long)users);
-    draw_text(22, 108, line, 2, COLOR_TEXT);
-    draw_text(174, 92, "FREE MEMORY", 1, COLOR_MUTED);
+    draw_card(12, 84, 43, "CONNECTED USERS", line, COLOR_TEXT);
     snprintf(line, sizeof(line), "%lu KB", (unsigned long)(free_heap / 1024));
-    draw_text(174, 108, line, 2, COLOR_TEXT);
+    draw_card(164, 84, 43, "FREE MEMORY", line, COLOR_TEXT);
 
-#if CONFIG_IRC_TLS_ENABLED
-    snprintf(line, sizeof(line), "IRC %d   TLS %d", PORT, CONFIG_IRC_TLS_PORT);
-#else
-    snprintf(line, sizeof(line), "IRC PORT %d", PORT);
-#endif
-    draw_text(12, 141, line, 1, COLOR_TEXT);
-
-    int64_t seconds;
-    if (clock_sync_now(&seconds, NULL)) {
-        time_t timestamp = (time_t)seconds;
-        struct tm utc;
-        gmtime_r(&timestamp, &utc);
+    format_uptime(line, sizeof(line), uptime_seconds);
+    draw_text(12, 138, line, 1, COLOR_MUTED);
+    struct tm utc;
+    if (get_utc(&utc)) {
         snprintf(line, sizeof(line), "UTC %02d:%02d:%02d", utc.tm_hour,
                  utc.tm_min, utc.tm_sec);
     } else {
         snprintf(line, sizeof(line), "UTC SYNCING");
     }
-    draw_text(12, 156, line, 1, COLOR_MUTED);
-    draw_text(236, 156, "T-DISPLAY-S3", 1, COLOR_MUTED);
+    draw_text(308 - (int)strlen(line) * 6, 138, line, 1, COLOR_MUTED);
+}
+
+static void compose_network(const wifi_status_t *wifi)
+{
+    char line[48];
+    draw_text(12, 43, "SERVER ADDRESS", 1, COLOR_MUTED);
+    draw_text(12, 59, wifi->connected ? wifi->ip_address : "WAITING FOR WIFI",
+              2, wifi->connected ? COLOR_ONLINE : COLOR_OFFLINE);
+
+    snprintf(line, sizeof(line), "%d", PORT);
+    draw_card(12, 87, 40, "IRC PORT", line, COLOR_TEXT);
+#if CONFIG_IRC_TLS_ENABLED
+    snprintf(line, sizeof(line), "%d", CONFIG_IRC_TLS_PORT);
+    draw_card(164, 87, 40, "TLS PORT", line, COLOR_ONLINE);
+#else
+    draw_card(164, 87, 40, "TLS", "DISABLED", COLOR_MUTED);
+#endif
+    format_signal(line, sizeof(line), wifi);
+    draw_text(12, 138, line, 1, COLOR_MUTED);
+}
+
+static void compose_system(uint64_t uptime_seconds)
+{
+    char line[48];
+    struct tm utc;
+    fill_rectangle(12, 42, 296, 40, COLOR_CARD);
+    draw_text(22, 49, "UTC CLOCK", 1, COLOR_MUTED);
+    if (get_utc(&utc)) {
+        snprintf(line, sizeof(line), "%02d:%02d:%02d", utc.tm_hour,
+                 utc.tm_min, utc.tm_sec);
+        draw_text(22, 63, line, 2, COLOR_TEXT);
+        strftime(line, sizeof(line), "%Y-%m-%d", &utc);
+        draw_text(238, 68, line, 1, COLOR_MUTED);
+    } else {
+        draw_text(22, 63, "SYNCING", 2, COLOR_OFFLINE);
+        draw_text(154, 68, "WAITING FOR NETWORK TIME", 1, COLOR_MUTED);
+    }
+
+    format_uptime(line, sizeof(line), uptime_seconds);
+    draw_text(12, 91, line, 1, COLOR_MUTED);
+    snprintf(line, sizeof(line), "%lu KB", (unsigned long)(
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
+    draw_card(12, 105, 40, "INTERNAL FREE", line, COLOR_TEXT);
+    snprintf(line, sizeof(line), "%lu KB", (unsigned long)(
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    draw_card(164, 105, 40, "PSRAM FREE", line, COLOR_TEXT);
+}
+
+static void compose_screen(display_view_t view, const wifi_status_t *wifi,
+                           uint32_t users, uint32_t free_heap, uint64_t uptime_seconds)
+{
+    static const char *const titles[] = {"OVERVIEW", "NETWORK", "SYSTEM"};
+    fill_rectangle(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, COLOR_BACKGROUND);
+    draw_text(12, 10, "ESP-IRC", 2, COLOR_ACCENT);
+    draw_text(114, 14, titles[view], 1, COLOR_TEXT);
+    draw_text(242, 14, wifi->connected ? "WIFI" : "OFFLINE", 1,
+              wifi->connected ? COLOR_ONLINE : COLOR_OFFLINE);
+    draw_wifi_icon(288, 10, wifi);
+    fill_rectangle(12, 32, 296, 1, COLOR_CARD);
+    fill_rectangle(12 + view * 100, 32, 96, 2, COLOR_ACCENT);
+
+    switch (view) {
+    case DISPLAY_VIEW_OVERVIEW:
+        compose_overview(wifi, users, free_heap, uptime_seconds);
+        break;
+    case DISPLAY_VIEW_NETWORK:
+        compose_network(wifi);
+        break;
+    case DISPLAY_VIEW_SYSTEM:
+        compose_system(uptime_seconds);
+        break;
+    default:
+        break;
+    }
+
+    fill_rectangle(12, 151, 296, 1, COLOR_CARD);
+    draw_text(12, 159, "< B1 PREV", 1, COLOR_ACCENT);
+    char page[16];
+    snprintf(page, sizeof(page), "%u/%u", (unsigned int)view + 1,
+             (unsigned int)DISPLAY_VIEW_COUNT);
+    draw_text(151, 159, page, 1, COLOR_TEXT);
+    draw_text(254, 159, "B2 NEXT >", 1, COLOR_ACCENT);
 }
 
 static esp_err_t display_flush(void)
@@ -345,14 +441,39 @@ void display_task(void *pvParameters)
         return;
     }
 
+    /* Both onboard buttons are active low, with internal pull-ups. */
+    gpio_config_t buttons = {
+        .pin_bit_mask = (1ULL << BUTTON_PREVIOUS_GPIO) | (1ULL << BUTTON_NEXT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    err = gpio_config(&buttons);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Button initialization failed: %s", esp_err_to_name(err));
+        display_cleanup();
+        vTaskDelete(NULL);
+        return;
+    }
+    display_navigation_t navigation;
+    display_navigation_init(&navigation, gpio_get_level(BUTTON_PREVIOUS_GPIO) == 0,
+                             gpio_get_level(BUTTON_NEXT_GPIO) == 0,
+                             esp_timer_get_time() / 1000);
+
+    int64_t previous_refresh_ms = 0;
     uint64_t previous_uptime = UINT64_MAX;
     bool backlight_on = false;
     while (1) {
-        uint64_t uptime = (uint64_t)(esp_timer_get_time() / 1000000);
-        if (uptime != previous_uptime) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        uint64_t uptime = (uint64_t)(now_ms / 1000);
+        bool view_changed = display_navigation_update(
+            &navigation, gpio_get_level(BUTTON_PREVIOUS_GPIO) == 0,
+            gpio_get_level(BUTTON_NEXT_GPIO) == 0, now_ms);
+        if (view_changed || previous_uptime == UINT64_MAX ||
+            (uptime != previous_uptime &&
+             now_ms - previous_refresh_ms >= CONFIG_DISPLAY_UPDATE_INTERVAL_MS)) {
             wifi_status_t wifi;
             wifi_get_status(&wifi);
-            compose_screen(&wifi, irc_server_get_user_count(),
+            compose_screen(navigation.view, &wifi, irc_server_get_user_count(),
                            esp_get_free_heap_size(), uptime);
             err = display_flush();
             if (err != ESP_OK) {
@@ -366,8 +487,10 @@ void display_task(void *pvParameters)
                 }
             }
             previous_uptime = uptime;
+            previous_refresh_ms = now_ms;
         }
-        TickType_t delay = pdMS_TO_TICKS(CONFIG_DISPLAY_UPDATE_INTERVAL_MS);
+        /* Input stays responsive even with a slow status refresh setting. */
+        TickType_t delay = pdMS_TO_TICKS(BUTTON_POLL_MS);
         vTaskDelay(delay > 0 ? delay : 1);
     }
 }

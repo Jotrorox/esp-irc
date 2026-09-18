@@ -2,8 +2,21 @@
 
 An ESP-IDF 6.0.2 IRC server with a status dashboard on the board's built-in
 ST7789 screen. Hold the board in landscape with its USB connector on the left.
-The display shows Wi-Fi/IP, connected users, free memory, listener ports,
-uptime, and UTC time.
+The display opens on an overview with Wi-Fi/IP, connected users, free memory,
+uptime, and UTC time. Use the two onboard buttons to cycle through three views:
+
+| View | Information |
+| --- | --- |
+| Overview | Connection, IP, users, total free memory, uptime and UTC |
+| Network | Server address, IRC/TLS ports, signal strength and channel |
+| System | UTC clock/date, uptime, free internal memory and PSRAM |
+
+**B1 (BOOT, GPIO 0)** goes to the previous view; **B2 (GPIO 14)** goes to the
+next. Navigation wraps around in both directions. The footer shows the controls
+and current page; the header keeps Wi-Fi status visible on every view. Presses
+are debounced, and holding a button does not repeatedly change pages. The chosen
+view stays selected until another press or a restart. Button assignments follow
+the [LILYGO pinout](https://github.com/Xinyuan-LilyGO/T-Display-S3#pinmap).
 
 The board uses 16 MB flash and 8 MB octal PSRAM. The existing storage partition
 layout is retained. Display wiring is fixed to the standard T-Display-S3:
@@ -35,3 +48,11 @@ chmod 600 main/certs/server.key
 
 Clients must trust this certificate explicitly. The certificate names do not
 configure DNS; use the IP shown on screen to reach the board.
+
+The button navigation logic can also be checked on the host without a board:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -Imain main/display_navigation.c \
+  tests/display_navigation_test.c -o /tmp/esp-irc-navigation-test
+/tmp/esp-irc-navigation-test
+```

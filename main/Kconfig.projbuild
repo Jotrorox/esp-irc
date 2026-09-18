@@ -1,9 +1,13 @@
 menu "T-Display-S3 built-in display"
 
     config DISPLAY_UPDATE_INTERVAL_MS
-        int "Display task update interval (ms)"
+        int "Minimum display status refresh interval (ms)"
         default 100
         range 10 60000
+        help
+            Status is refreshed at most once per second, subject to this
+            minimum interval. Buttons are polled independently every 10 ms
+            and switching views always refreshes the display immediately.
 
 endmenu
 
