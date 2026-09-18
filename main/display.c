@@ -6,12 +6,17 @@
 
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "esp_err.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "driver/i2c_master.h"
 
 #include "clock_sync.h"
 #include "config.h"
@@ -21,13 +26,35 @@
 #undef TAG
 static const char *TAG = "display";
 
-#define DISPLAY_WIDTH  128
-#define DISPLAY_HEIGHT 64
-#define DISPLAY_PAGES  (DISPLAY_HEIGHT / 8)
-#define I2C_MASTER_PORT I2C_NUM_0
-#define I2C_TIMEOUT_MS  1000
+/* T-Display-S3 ST7789, landscape with the USB connector on the left.
+ * Pinout and panel timing: https://github.com/Xinyuan-LilyGO/LilyGo-Display-IDF
+ */
+#define DISPLAY_WIDTH       320
+#define DISPLAY_HEIGHT      170
+#define TRANSFER_ROWS       20
+#define TRANSFER_BYTES      (DISPLAY_WIDTH * TRANSFER_ROWS * sizeof(uint16_t))
+#define LCD_POWER_GPIO      15
+#define LCD_BACKLIGHT_GPIO  38
+#define LCD_RESET_GPIO      5
+#define LCD_CS_GPIO         6
+#define LCD_DC_GPIO         7
+#define LCD_WR_GPIO         8
+#define LCD_RD_GPIO         9
 
-static uint8_t framebuffer[DISPLAY_WIDTH * DISPLAY_PAGES];
+#define COLOR_BACKGROUND 0x0841
+#define COLOR_CARD       0x10c3
+#define COLOR_TEXT       0xffff
+#define COLOR_MUTED      0x9cf3
+#define COLOR_ACCENT     0x2e7f
+#define COLOR_ONLINE     0x47ef
+#define COLOR_OFFLINE    0xfd26
+
+static uint16_t *framebuffer;
+static uint16_t *transfer_buffer;
+static SemaphoreHandle_t transfer_done;
+static esp_lcd_i80_bus_handle_t lcd_bus;
+static esp_lcd_panel_io_handle_t lcd_io;
+static esp_lcd_panel_handle_t lcd_panel;
 
 /* 5x7 glyphs for 0-9, A-Z, '.', ':', and '-'. */
 static const char glyph_characters[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-";
@@ -54,189 +81,228 @@ static const uint8_t glyphs[][5] = {
     {0x08,0x08,0x08,0x08,0x08},
 };
 
-static esp_err_t display_send_commands(i2c_master_dev_handle_t device,
-                                       const uint8_t *commands, size_t length)
+static bool display_transfer_done(esp_lcd_panel_io_handle_t io,
+                                  esp_lcd_panel_io_event_data_t *event,
+                                  void *context)
 {
-    uint8_t data[32];
-    if (length + 1 > sizeof(data)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    data[0] = 0x00;
-    memcpy(&data[1], commands, length);
-    return i2c_master_transmit(device, data, length + 1, I2C_TIMEOUT_MS);
+    (void)io;
+    (void)event;
+    BaseType_t task_woken = pdFALSE;
+    xSemaphoreGiveFromISR((SemaphoreHandle_t)context, &task_woken);
+    return task_woken == pdTRUE;
 }
 
-static esp_err_t display_controller_init(i2c_master_dev_handle_t device)
+static esp_err_t display_controller_init(void)
 {
-    const uint8_t commands[] = {
-        0xae,       /* Display off. */
-        0xd5, 0x80, /* Clock divide ratio. */
-        0xa8, 0x3f, /* 64 multiplexed rows. */
-        0xd3, 0x00, /* No display offset. */
-        0x40,       /* Start line 0. */
-        0x8d, 0x14, /* Enable SSD1306 charge pump (ignored by SSD1309). */
-        0x20, 0x00, /* Horizontal addressing mode. */
-        0xa1,       /* Mirror columns. */
-        0xc8,       /* Scan rows from COM63 to COM0. */
-        0xda, 0x12, /* Alternative COM pin layout for 128x64. */
-        0x81, 0xcf, /* Contrast. */
-        0xd9, 0xf1, /* Pre-charge period. */
-        0xdb, 0x40, /* VCOMH deselect level. */
-        0xa4,       /* Use display RAM. */
-        0xa6,       /* Normal (not inverted) pixels. */
-        0xaf,       /* Display on. */
+    gpio_config_t outputs = {
+        .pin_bit_mask = (1ULL << LCD_POWER_GPIO) |
+                        (1ULL << LCD_BACKLIGHT_GPIO) | (1ULL << LCD_RD_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
     };
-    return display_send_commands(device, commands, sizeof(commands));
+    ESP_RETURN_ON_ERROR(gpio_config(&outputs), TAG, "configure LCD outputs");
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_BACKLIGHT_GPIO, 0), TAG, "backlight off");
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_POWER_GPIO, 1), TAG, "LCD power on");
+    ESP_RETURN_ON_ERROR(gpio_set_level(LCD_RD_GPIO, 1), TAG, "disable LCD reads");
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    transfer_done = xSemaphoreCreateBinary();
+    framebuffer = heap_caps_malloc(DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (transfer_done == NULL || framebuffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_lcd_i80_bus_config_t bus_config = {
+        .dc_gpio_num = LCD_DC_GPIO,
+        .wr_gpio_num = LCD_WR_GPIO,
+        .clk_src = LCD_CLK_SRC_DEFAULT,
+        .data_gpio_nums = {39, 40, 41, 42, 45, 46, 47, 48},
+        .bus_width = 8,
+        .max_transfer_bytes = TRANSFER_BYTES,
+        .dma_burst_size = 64,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_i80_bus(&bus_config, &lcd_bus), TAG,
+                        "create LCD bus");
+
+    esp_lcd_panel_io_i80_config_t io_config = {
+        .cs_gpio_num = LCD_CS_GPIO,
+        .pclk_hz = 10 * 1000 * 1000,
+        .trans_queue_depth = 1,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .dc_levels = {.dc_data_level = 1},
+        /* Native RGB565 words are little endian; ST7789 expects MSB first. */
+        .flags.swap_color_bytes = true,
+        .on_color_trans_done = display_transfer_done,
+        .user_ctx = transfer_done,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i80(lcd_bus, &io_config, &lcd_io),
+                        TAG, "create LCD IO");
+    transfer_buffer = esp_lcd_i80_alloc_draw_buffer(
+        lcd_io, TRANSFER_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (transfer_buffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = LCD_RESET_GPIO,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .data_endian = LCD_RGB_DATA_ENDIAN_BIG,
+        .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &lcd_panel),
+                        TAG, "create ST7789 panel");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(lcd_panel), TAG, "reset LCD");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(lcd_panel), TAG, "initialize LCD");
+
+    /* LILYGO's panel-specific porch, voltage and gamma register values. */
+    static const struct {
+        uint8_t command;
+        uint8_t length;
+        uint8_t data[14];
+    } panel_commands[] = {
+        {0x3a, 1, {0x05}},
+        {0xb2, 5, {0x0b, 0x0b, 0x00, 0x33, 0x33}},
+        {0xb7, 1, {0x75}},
+        {0xbb, 1, {0x28}},
+        {0xc0, 1, {0x2c}},
+        {0xc2, 1, {0x01}},
+        {0xc3, 1, {0x1f}},
+        {0xc6, 1, {0x13}},
+        {0xd0, 1, {0xa7}},
+        {0xd0, 2, {0xa4, 0xa1}},
+        {0xd6, 1, {0xa1}},
+        {0xe0, 14, {0xf0, 0x05, 0x0a, 0x06, 0x06, 0x03, 0x2b,
+                    0x32, 0x43, 0x36, 0x11, 0x10, 0x2b, 0x32}},
+        {0xe1, 14, {0xf0, 0x08, 0x0c, 0x0b, 0x09, 0x24, 0x2b,
+                    0x22, 0x43, 0x38, 0x15, 0x16, 0x2f, 0x37}},
+    };
+    for (size_t i = 0; i < sizeof(panel_commands) / sizeof(panel_commands[0]); ++i) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(lcd_io,
+                            panel_commands[i].command, panel_commands[i].data,
+                            panel_commands[i].length), TAG, "configure LCD panel");
+    }
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(lcd_panel, true), TAG, "LCD inversion");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(lcd_panel, true), TAG, "LCD landscape");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(lcd_panel, false, true), TAG, "LCD orientation");
+    /* The visible 170 rows occupy the middle of the controller's 240 rows. */
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(lcd_panel, 0, 35), TAG, "LCD offset");
+    return esp_lcd_panel_disp_on_off(lcd_panel, true);
 }
 
-static esp_err_t display_i2c_init(i2c_master_bus_handle_t *bus,
-                                  i2c_master_dev_handle_t *device)
+static void display_cleanup(void)
 {
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_MASTER_PORT,
-        .sda_io_num = CONFIG_DISPLAY_I2C_SDA_GPIO,
-        .scl_io_num = CONFIG_DISPLAY_I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_config, bus);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = i2c_master_probe(*bus, CONFIG_DISPLAY_I2C_ADDRESS, I2C_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "No display at I2C address 0x%02x on SDA GPIO %d/SCL GPIO %d",
-                 CONFIG_DISPLAY_I2C_ADDRESS, CONFIG_DISPLAY_I2C_SDA_GPIO,
-                 CONFIG_DISPLAY_I2C_SCL_GPIO);
-        i2c_del_master_bus(*bus);
-        *bus = NULL;
-        return err;
-    }
-
-    i2c_device_config_t device_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = CONFIG_DISPLAY_I2C_ADDRESS,
-        .scl_speed_hz = CONFIG_DISPLAY_I2C_FREQUENCY,
-    };
-    err = i2c_master_bus_add_device(*bus, &device_config, device);
-    if (err != ESP_OK) {
-        i2c_del_master_bus(*bus);
-        *bus = NULL;
-    }
-    return err;
+    gpio_set_level(LCD_BACKLIGHT_GPIO, 0);
+    if (lcd_panel != NULL) esp_lcd_panel_del(lcd_panel);
+    if (lcd_io != NULL) esp_lcd_panel_io_del(lcd_io);
+    if (lcd_bus != NULL) esp_lcd_del_i80_bus(lcd_bus);
+    if (transfer_done != NULL) vSemaphoreDelete(transfer_done);
+    heap_caps_free(transfer_buffer);
+    heap_caps_free(framebuffer);
 }
 
-static void set_pixel(int x, int y)
+static void set_pixel(int x, int y, uint16_t color)
 {
     if (x >= 0 && x < DISPLAY_WIDTH && y >= 0 && y < DISPLAY_HEIGHT) {
-        framebuffer[x + (y / 8) * DISPLAY_WIDTH] |= (uint8_t)(1U << (y & 7));
+        framebuffer[y * DISPLAY_WIDTH + x] = color;
     }
 }
 
-static const uint8_t *find_glyph(char character)
+static void fill_rectangle(int x, int y, int width, int height, uint16_t color)
+{
+    for (int row = y; row < y + height; ++row) {
+        for (int column = x; column < x + width; ++column) {
+            set_pixel(column, row, color);
+        }
+    }
+}
+
+static void draw_character(int x, int y, char character, int scale, uint16_t color)
 {
     const char *match = strchr(glyph_characters, character);
-    return match == NULL ? NULL : glyphs[match - glyph_characters];
-}
-
-static void draw_character(int x, int y, char character, int scale)
-{
-    const uint8_t *glyph = find_glyph(character);
-    if (glyph == NULL) {
+    if (match == NULL) {
         return;
     }
+    const uint8_t *glyph = glyphs[match - glyph_characters];
     for (int column = 0; column < 5; ++column) {
         for (int row = 0; row < 7; ++row) {
             if ((glyph[column] & (1U << row)) != 0) {
-                for (int dx = 0; dx < scale; ++dx) {
-                    for (int dy = 0; dy < scale; ++dy) {
-                        set_pixel(x + column * scale + dx, y + row * scale + dy);
-                    }
-                }
+                fill_rectangle(x + column * scale, y + row * scale, scale, scale, color);
             }
         }
     }
 }
 
-static void draw_text(int x, int y, const char *text, int scale)
+static void draw_text(int x, int y, const char *text, int scale, uint16_t color)
 {
-    while (*text != '\0') {
-        draw_character(x, y, *text++, scale);
+    while (*text != '\0' && x + 5 * scale <= DISPLAY_WIDTH) {
+        draw_character(x, y, *text++, scale, color);
         x += 6 * scale;
     }
 }
 
-static void draw_wifi_icon(int x, int y, bool connected)
+static void draw_wifi_icon(int x, int y, const wifi_status_t *wifi)
 {
-    if (!connected) {
-        /* A small X clearly distinguishes disconnected from weak signal. */
-        for (int i = 0; i < 9; ++i) {
-            set_pixel(x + i, y + i);
-            set_pixel(x + 8 - i, y + i);
-        }
-        return;
+    int bars = !wifi->connected ? 0 : wifi->rssi >= -60 ? 3 : wifi->rssi >= -75 ? 2 : 1;
+    for (int i = 0; i < 3; ++i) {
+        int height = 6 + i * 5;
+        fill_rectangle(x + i * 7, y + 16 - height, 5, height,
+                       i < bars ? COLOR_ONLINE : COLOR_MUTED);
     }
-
-    /* Three progressively smaller arcs and the center dot. */
-    const uint8_t rows[] = {0x7c, 0x82, 0x38, 0x44, 0x10, 0x28, 0x00, 0x10};
-    for (int row = 0; row < 8; ++row) {
-        for (int column = 0; column < 8; ++column) {
-            if ((rows[row] & (1U << (7 - column))) != 0) {
-                set_pixel(x + column, y + row);
-            }
+    if (!wifi->connected) {
+        for (int i = 0; i < 19; ++i) {
+            set_pixel(x + i, y + 17 - i, COLOR_OFFLINE);
+            set_pixel(x + i, y + 18 - i, COLOR_OFFLINE);
         }
-    }
-}
-
-static void draw_horizontal_line(int y)
-{
-    for (int x = 0; x < DISPLAY_WIDTH; ++x) {
-        set_pixel(x, y);
     }
 }
 
 static void compose_screen(const wifi_status_t *wifi, uint32_t users,
                            uint32_t free_heap, uint64_t uptime_seconds)
 {
-    memset(framebuffer, 0, sizeof(framebuffer));
+    fill_rectangle(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, COLOR_BACKGROUND);
+    draw_text(12, 10, "ESP-IRC", 2, COLOR_ACCENT);
 
     char line[48];
     uint64_t days = uptime_seconds / 86400;
     uint64_t hours = (uptime_seconds / 3600) % 24;
     uint64_t minutes = (uptime_seconds / 60) % 60;
     if (days > 0) {
-        snprintf(line, sizeof(line), "ESP-IRC UP %lluD%02lluH",
+        snprintf(line, sizeof(line), "UP %lluD %02lluH",
                  (unsigned long long)days, (unsigned long long)hours);
     } else {
-        snprintf(line, sizeof(line), "ESP-IRC UP %02llu:%02llu",
+        snprintf(line, sizeof(line), "UP %02llu:%02llu",
                  (unsigned long long)hours, (unsigned long long)minutes);
     }
-    draw_text(1, 1, line, 1);
-    draw_horizontal_line(10);
+    draw_text(DISPLAY_WIDTH - 12 - (int)strlen(line) * 6, 14, line, 1, COLOR_MUTED);
+    fill_rectangle(12, 32, 296, 1, COLOR_MUTED);
 
-    draw_wifi_icon(2, 14, wifi->connected);
-    draw_text(15, 14, wifi->connected ? wifi->ip_address : "WIFI DISCONNECTED", 1);
-
+    draw_wifi_icon(12, 45, wifi);
+    draw_text(42, 44, wifi->connected ? wifi->ip_address : "WIFI DISCONNECTED",
+              2, wifi->connected ? COLOR_ONLINE : COLOR_OFFLINE);
     if (wifi->connected) {
-        snprintf(line, sizeof(line), "SIGNAL %dDBM CH %u", wifi->rssi,
+        snprintf(line, sizeof(line), "SIGNAL %d DBM   CHANNEL %u", wifi->rssi,
                  (unsigned int)wifi->channel);
     } else {
         snprintf(line, sizeof(line), "WAITING TO RECONNECT");
     }
-    draw_text(2, 25, line, 1);
+    draw_text(42, 66, line, 1, COLOR_MUTED);
 
-    snprintf(line, sizeof(line), "USERS %lu  MEM %luKB", (unsigned long)users,
-             (unsigned long)(free_heap / 1024));
-    draw_text(2, 36, line, 1);
+    fill_rectangle(12, 84, 142, 47, COLOR_CARD);
+    fill_rectangle(164, 84, 144, 47, COLOR_CARD);
+    draw_text(22, 92, "CONNECTED USERS", 1, COLOR_MUTED);
+    snprintf(line, sizeof(line), "%lu", (unsigned long)users);
+    draw_text(22, 108, line, 2, COLOR_TEXT);
+    draw_text(174, 92, "FREE MEMORY", 1, COLOR_MUTED);
+    snprintf(line, sizeof(line), "%lu KB", (unsigned long)(free_heap / 1024));
+    draw_text(174, 108, line, 2, COLOR_TEXT);
 
 #if CONFIG_IRC_TLS_ENABLED
-    snprintf(line, sizeof(line), "IRC %d  TLS %d", PORT, CONFIG_IRC_TLS_PORT);
+    snprintf(line, sizeof(line), "IRC %d   TLS %d", PORT, CONFIG_IRC_TLS_PORT);
 #else
     snprintf(line, sizeof(line), "IRC PORT %d", PORT);
 #endif
-    draw_text(2, 47, line, 1);
+    draw_text(12, 141, line, 1, COLOR_TEXT);
 
     int64_t seconds;
     if (clock_sync_now(&seconds, NULL)) {
@@ -248,26 +314,22 @@ static void compose_screen(const wifi_status_t *wifi, uint32_t users,
     } else {
         snprintf(line, sizeof(line), "UTC SYNCING");
     }
-    draw_text(2, 57, line, 1);
+    draw_text(12, 156, line, 1, COLOR_MUTED);
+    draw_text(236, 156, "T-DISPLAY-S3", 1, COLOR_MUTED);
 }
 
-static esp_err_t display_flush(i2c_master_dev_handle_t device)
+static esp_err_t display_flush(void)
 {
-    const uint8_t address_commands[] = {0x21, 0, 127, 0x22, 0, 7};
-    esp_err_t err = display_send_commands(device, address_commands,
-                                          sizeof(address_commands));
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    uint8_t data[DISPLAY_WIDTH + 1];
-    data[0] = 0x40;
-    for (int page = 0; page < DISPLAY_PAGES; ++page) {
-        memcpy(&data[1], &framebuffer[page * DISPLAY_WIDTH], DISPLAY_WIDTH);
-        err = i2c_master_transmit(device, data, sizeof(data), I2C_TIMEOUT_MS);
-        if (err != ESP_OK) {
-            return err;
-        }
+    for (int y = 0; y < DISPLAY_HEIGHT; y += TRANSFER_ROWS) {
+        int rows = DISPLAY_HEIGHT - y;
+        if (rows > TRANSFER_ROWS) rows = TRANSFER_ROWS;
+        memcpy(transfer_buffer, &framebuffer[y * DISPLAY_WIDTH],
+               DISPLAY_WIDTH * rows * sizeof(uint16_t));
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(lcd_panel, 0, y,
+                            DISPLAY_WIDTH, y + rows, transfer_buffer),
+                            TAG, "write LCD pixels");
+        /* The draw call queues DMA; do not reuse its buffer until completion. */
+        xSemaphoreTake(transfer_done, portMAX_DELAY);
     }
     return ESP_OK;
 }
@@ -275,24 +337,16 @@ static esp_err_t display_flush(i2c_master_dev_handle_t device)
 void display_task(void *pvParameters)
 {
     (void)pvParameters;
-    i2c_master_bus_handle_t bus = NULL;
-    i2c_master_dev_handle_t device = NULL;
-
-    esp_err_t err = display_i2c_init(&bus, &device);
-    if (err == ESP_OK) {
-        err = display_controller_init(device);
-    }
+    esp_err_t err = display_controller_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Display initialization failed: %s", esp_err_to_name(err));
-        if (device != NULL) i2c_master_bus_rm_device(device);
-        if (bus != NULL) i2c_del_master_bus(bus);
+        display_cleanup();
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "SSD1306/SSD1309 display initialized");
     uint64_t previous_uptime = UINT64_MAX;
-
+    bool backlight_on = false;
     while (1) {
         uint64_t uptime = (uint64_t)(esp_timer_get_time() / 1000000);
         if (uptime != previous_uptime) {
@@ -300,12 +354,20 @@ void display_task(void *pvParameters)
             wifi_get_status(&wifi);
             compose_screen(&wifi, irc_server_get_user_count(),
                            esp_get_free_heap_size(), uptime);
-            err = display_flush(device);
+            err = display_flush();
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Display update failed: %s", esp_err_to_name(err));
+            } else if (!backlight_on) {
+                /* Reveal only a completely drawn frame on startup. */
+                err = gpio_set_level(LCD_BACKLIGHT_GPIO, 1);
+                if (err == ESP_OK) {
+                    backlight_on = true;
+                    ESP_LOGI(TAG, "T-Display-S3 ST7789 initialized: 320x170 landscape, first frame displayed");
+                }
             }
             previous_uptime = uptime;
         }
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_DISPLAY_UPDATE_INTERVAL_MS));
+        TickType_t delay = pdMS_TO_TICKS(CONFIG_DISPLAY_UPDATE_INTERVAL_MS);
+        vTaskDelay(delay > 0 ? delay : 1);
     }
 }

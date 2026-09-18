@@ -35,7 +35,7 @@ void app_main(void)
     // Default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    ESP_LOGI("main", "XIAO ESP32-S3: %u MB PSRAM available, using CPU cores 0 and 1",
+    ESP_LOGI("main", "LILYGO T-Display-S3: %u MB PSRAM available, using CPU cores 0 and 1",
              (unsigned int)(esp_psram_get_size() / (1024 * 1024)));
 
     clock_sync_init();
@@ -48,7 +48,7 @@ void app_main(void)
     BaseType_t display_task_created = xTaskCreatePinnedToCore(
         display_task,
         "display",
-        3072,
+        4096,
         NULL,
         4,
         NULL,

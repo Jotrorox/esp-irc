@@ -2,7 +2,7 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.22)
 
-# This project targets the Seeed Studio XIAO ESP32-S3 (8 MB flash/8 MB PSRAM).
+# This project targets the LILYGO T-Display-S3 (16 MB flash/8 MB PSRAM).
 # Keep the target here so a fresh checkout cannot silently build for another chip.
 set(IDF_TARGET "esp32s3")
 
